@@ -1,8 +1,8 @@
-# Qwen 3 Vision Model: [`Qwen3 VL Collection`](https://huggingface.co/collections/Qwen/qwen3-vl)
+# Qwen 3/Qwen3.5 Vision Model: [`Qwen3 VL Collection`](https://huggingface.co/collections/Qwen/qwen3-vl)
 
-The Qwen 3 VL models are the successors to the Qwen 2.5 VL models, featuring a diverse lineup of increased performance, flexible sizes, and reasoning-capable models.
+The Qwen 3 and 3.5 VL models are the successors to the Qwen 2.5 VL models, featuring a diverse lineup of increased performance, flexible sizes, and reasoning-capable models.
 
-Mistral.rs supports the Qwen 3 VL vision model family (including MoE variants), with examples in the Rust, Python, and HTTP APIs. ISQ quantization is supported to allow running the model with less memory requirements. MoE variants also support [MoQE](ISQ.md) via the `--organization moqe` flag.
+Mistral.rs supports the Qwen 3 and 3.5 VL vision model families (including MoE variants), with examples in the Rust, Python, and HTTP APIs. ISQ quantization is supported to allow running the model with less memory requirements. MoE variants also support [MoQE](ISQ.md) via the `--organization moqe` flag.
 
 UQFF quantizations are also available.
 
@@ -30,7 +30,16 @@ Mistral.rs supports interactive mode for vision models! It is an easy way to int
 Start up interactive mode with the Qwen3 VL model:
 
 ```
+# Build (CUDA)
+cargo build --release --features cuda,nccl
+# Legacy model
 mistralrs run vision -m Qwen/Qwen3-VL-4B-Instruct
+# Single rank
+CUDA_VISIBLE_DEVICES=0 mistralrs run vision -m Qwen/Qwen3.5-35B-A3B
+# Multirank
+CUDA_VISIBLE_DEVICES=0,1 mistralrs run vision -m Qwen/Qwen3.5-35B-A3B
+# Qwen3.5 Dense
+mistralrs run vision -m Qwen/Qwen3.5-27B
 ```
 
 ## HTTP server

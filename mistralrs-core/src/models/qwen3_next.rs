@@ -1,6 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Embedding, Linear};
 use mistralrs_quant::{
     ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
@@ -21,7 +21,8 @@ use crate::{
         embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding, Sdpa,
     },
     layers_masker::PastKvLenCache,
-    moe::{MoEExperts, MoEExpertsConfig},
+    models::deltanet::{DeltaNetConfig, GatedDeltaNet, GdnLayerCache, GdnProjection},
+    moe::{MoEExperts, MoEExpertsConfig, MoELayout},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -119,657 +120,50 @@ impl Config {
     }
 }
 
-// ====================== RMSNorm Gated (for GDN output) ======================
-
-/// RMSNorm with gating: `rms_norm(x) * weight * silu(gate)`
-struct RmsNormGated {
-    weight: Tensor,
-    eps: f64,
-}
-
-impl RmsNormGated {
-    fn new(
-        size: usize,
-        eps: f64,
-        vb: ShardedVarBuilder,
-        isq_target_device: Option<&Device>,
-    ) -> Result<Self> {
-        let mut weight = vb.get(size, "weight")?;
-        if let Some(target_dev) = isq_target_device {
-            weight = weight.to_device(target_dev)?;
-        }
-        Ok(Self { weight, eps })
+impl DeltaNetConfig for Config {
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
     }
 
-    fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
-        let dtype = x.dtype();
-        let x = x.to_dtype(DType::F32)?;
-        let gate = candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?;
-        let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
-        let normed = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
-        let out = normed
-            .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?
-            .broadcast_mul(&gate)?;
-        out.to_dtype(dtype)
-    }
-}
-
-// ====================== GDN layer cache ======================
-
-#[derive(Debug)]
-struct GdnLayerCache {
-    /// Conv state: (batch, conv_dim, kernel_size)
-    conv_state: Tensor,
-    /// Recurrent state: (batch, num_v_heads, head_k_dim, head_v_dim)
-    recurrent_state: Tensor,
-    seqlen_offset: usize,
-}
-
-impl GdnLayerCache {
-    fn new(cfg: &Config, dtype: DType, device: &Device) -> Result<Self> {
-        let conv_dim = cfg.linear_conv_dim();
-        let conv_state = Tensor::zeros((1, conv_dim, cfg.linear_conv_kernel_dim), dtype, device)?;
-        let recurrent_state = Tensor::zeros(
-            (
-                1,
-                cfg.linear_num_value_heads,
-                cfg.linear_key_head_dim,
-                cfg.linear_value_head_dim,
-            ),
-            dtype,
-            device,
-        )?;
-        Ok(Self {
-            conv_state,
-            recurrent_state,
-            seqlen_offset: 0,
-        })
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
     }
 
-    fn reset(&mut self) -> Result<()> {
-        self.conv_state = self.conv_state.zeros_like()?;
-        self.recurrent_state = self.recurrent_state.zeros_like()?;
-        self.seqlen_offset = 0;
-        Ok(())
-    }
-}
-
-impl Clone for GdnLayerCache {
-    fn clone(&self) -> Self {
-        Self {
-            conv_state: self.conv_state.clone(),
-            recurrent_state: self.recurrent_state.clone(),
-            seqlen_offset: self.seqlen_offset,
-        }
-    }
-}
-
-// ====================== GDN math functions ======================
-
-fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
-    let inv_norm = x
-        .sqr()?
-        .sum_keepdim(D::Minus1)?
-        .broadcast_add(&Tensor::new(eps as f32, x.device())?.to_dtype(x.dtype())?)?
-        .sqrt()?
-        .recip()?;
-    x.broadcast_mul(&inv_norm)
-}
-
-fn softplus(x: &Tensor) -> Result<Tensor> {
-    (Tensor::ones_like(x)? + x.exp()?)?.log()
-}
-
-/// Recurrent gated delta rule (used for both prefill and decode).
-/// Matches torch_recurrent_gated_delta_rule from the reference implementation.
-///
-/// q, k: (batch, seq, num_v_heads, head_k_dim)
-/// v:    (batch, seq, num_v_heads, head_v_dim)
-/// g:    (batch, seq, num_v_heads)
-/// beta: (batch, seq, num_v_heads)
-/// state: (batch, num_v_heads, head_k_dim, head_v_dim)
-///
-/// Returns: (batch, seq, num_v_heads, head_v_dim)
-fn gated_delta_rule_recurrence(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    g: &Tensor,
-    beta: &Tensor,
-    state: &mut Tensor,
-) -> Result<Tensor> {
-    let dtype = q.dtype();
-    let k_head_dim = q.dim(D::Minus1)?;
-    let scale = 1.0 / (k_head_dim as f64).sqrt();
-
-    // Transpose to (batch, heads, seq, dim) and cast to f32
-    let q = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?;
-    let k = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
-    let v = v.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
-    // g, beta: (batch, seq, heads) -> (batch, heads, seq)
-    let g = g.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
-    let beta = beta.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
-
-    let seq_len = q.dim(2)?;
-    let mut s = state.to_dtype(DType::F32)?;
-    let mut outputs = Vec::with_capacity(seq_len);
-
-    for i in 0..seq_len {
-        // q_t, k_t: (batch, heads, k_dim); v_t: (batch, heads, v_dim)
-        let q_t = q.i((.., .., i, ..))?;
-        let k_t = k.i((.., .., i, ..))?;
-        let v_t = v.i((.., .., i, ..))?;
-        // g_t, beta_t: (batch, heads)
-        let g_t = g.i((.., .., i))?;
-        let beta_t = beta.i((.., .., i))?;
-
-        // s = s * exp(g_t)
-        let decay = g_t.exp()?.unsqueeze(D::Minus1)?.unsqueeze(D::Minus1)?;
-        s = s.broadcast_mul(&decay)?;
-
-        // kv_mem = (s * k_t[:,:,:,None]).sum(dim=2) -> (batch, heads, v_dim)
-        let k_exp = k_t.unsqueeze(D::Minus1)?; // (batch, heads, k_dim, 1)
-        let kv_mem = s.broadcast_mul(&k_exp)?.sum(2)?;
-
-        // delta = (v_t - kv_mem) * beta_t[:,:,None]
-        let beta_exp = beta_t.unsqueeze(D::Minus1)?;
-        let delta = (v_t - kv_mem)?.broadcast_mul(&beta_exp)?;
-
-        // s = s + k_t[:,:,:,None] * delta[:,:,None,:]
-        let outer = k_exp.broadcast_mul(&delta.unsqueeze(2)?)?;
-        s = (s + outer)?;
-
-        // y_t = (s * q_t[:,:,:,None]).sum(dim=2) -> (batch, heads, v_dim)
-        let q_exp = q_t.unsqueeze(D::Minus1)?;
-        let y_t = s.broadcast_mul(&q_exp)?.sum(2)?;
-
-        outputs.push(y_t);
+    fn linear_num_key_heads(&self) -> usize {
+        self.linear_num_key_heads
     }
 
-    *state = s.to_dtype(state.dtype())?;
-
-    // Stack: (batch, heads, v_dim) * seq -> (batch, heads, seq, v_dim)
-    let out = Tensor::stack(&outputs, 2)?;
-    // Transpose back to (batch, seq, heads, v_dim)
-    out.transpose(1, 2)?.contiguous()?.to_dtype(dtype)
-}
-
-// ====================== Gated Delta Net layer ======================
-
-struct GatedDeltaNet {
-    in_proj_qkvz: Linear,
-    in_proj_ba: Linear,
-    conv1d_weight: Tensor,
-    dt_bias: Tensor,
-    a_log: Tensor,
-    norm: RmsNormGated,
-    out_proj: Arc<dyn QuantMethod>,
-    num_k_heads: usize,
-    num_v_heads: usize,
-    head_k_dim: usize,
-    head_v_dim: usize,
-    conv_kernel_size: usize,
-    key_dim: usize,
-    value_dim: usize,
-}
-
-impl GatedDeltaNet {
-    fn load(
-        vb: ShardedVarBuilder,
-        cfg: &Config,
-        mapper: &dyn DeviceMapper,
-        layer_idx: usize,
-        loading_isq: bool,
-        comm: &Arc<mistralrs_quant::Comm>,
-    ) -> Result<Self> {
-        // When ISQ is enabled, get target device so non-quantizable weights go to GPU
-        let isq_target_device = if loading_isq {
-            mapper.device_for(layer_idx, false).cloned()
-        } else {
-            None
-        };
-
-        let num_k_heads = cfg.linear_num_key_heads;
-        let num_v_heads = cfg.linear_num_value_heads;
-        let head_k_dim = cfg.linear_key_head_dim;
-        let head_v_dim = cfg.linear_value_head_dim;
-        let key_dim = num_k_heads * head_k_dim;
-        let value_dim = num_v_heads * head_v_dim;
-        let conv_kernel_size = cfg.linear_conv_kernel_dim;
-
-        let vb_la = mapper.set_device(layer_idx, vb.pp("linear_attn"), loading_isq);
-
-        // in_proj_qkvz: hidden_size -> key_dim * 2 + value_dim * 2
-        // Output: [q (key_dim), k (key_dim), v (value_dim), z (value_dim)]
-        let qkvz_out = key_dim * 2 + value_dim * 2;
-        let mut qkvz_w = vb_la.get((qkvz_out, cfg.hidden_size), "in_proj_qkvz.weight")?;
-
-        // in_proj_ba: hidden_size -> num_v_heads * 2 (beta and alpha per head)
-        let mut ba_w = vb_la.get((num_v_heads * 2, cfg.hidden_size), "in_proj_ba.weight")?;
-
-        // Conv1d weight: (conv_dim, 1, kernel_size)
-        let conv_dim = key_dim * 2 + value_dim; // q, k, v concatenated
-        let mut conv1d_weight = vb_la.get((conv_dim, 1, conv_kernel_size), "conv1d.weight")?;
-
-        // dt_bias and A_log
-        let mut dt_bias = vb_la.get(num_v_heads, "dt_bias")?;
-        let mut a_log = vb_la.get(num_v_heads, "A_log")?;
-
-        // Move non-quantizable tensors to target device for ISQ compatibility
-        if let Some(ref target_dev) = isq_target_device {
-            qkvz_w = qkvz_w.to_device(target_dev)?;
-            ba_w = ba_w.to_device(target_dev)?;
-            conv1d_weight = conv1d_weight.to_device(target_dev)?;
-            dt_bias = dt_bias.to_device(target_dev)?;
-            a_log = a_log.to_device(target_dev)?;
-        }
-
-        let in_proj_qkvz = Linear::new(qkvz_w, None);
-        let in_proj_ba = Linear::new(ba_w, None);
-
-        // Gated RMSNorm for output
-        let norm = RmsNormGated::new(
-            head_v_dim,
-            cfg.rms_norm_eps,
-            vb_la.pp("norm"),
-            isq_target_device.as_ref(),
-        )?;
-
-        // Output projection
-        let out_proj = RowParallelLayer::new(
-            value_dim,
-            cfg.hidden_size,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb_la.pp("out_proj"),
-        )?;
-
-        Ok(Self {
-            in_proj_qkvz,
-            in_proj_ba,
-            conv1d_weight,
-            dt_bias,
-            a_log,
-            norm,
-            out_proj,
-            num_k_heads,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-            conv_kernel_size,
-            key_dim,
-            value_dim,
-        })
+    fn linear_num_value_heads(&self) -> usize {
+        self.linear_num_value_heads
     }
 
-    fn forward(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
-        let (batch_size, seq_len, _hidden) = x.dims3()?;
-        let dtype = x.dtype();
-
-        // 1. Project input
-        let mixed_qkvz = self.in_proj_qkvz.forward(x)?; // (batch, seq, key_dim*2 + value_dim*2)
-        let mixed_ba = self.in_proj_ba.forward(x)?; // (batch, seq, num_v_heads * 2)
-
-        // 2. fix_query_key_value_ordering: grouped head layout
-        // The projection is grouped by num_k_heads. Within each group:
-        //   [head_k_dim, head_k_dim, v_per_group*head_v_dim, v_per_group*head_v_dim]
-        let v_per_group = self.num_v_heads / self.num_k_heads;
-        let group_size_qkvz = 2 * self.head_k_dim + 2 * v_per_group * self.head_v_dim;
-        let mixed_qkvz =
-            mixed_qkvz.reshape((batch_size, seq_len, self.num_k_heads, group_size_qkvz))?;
-
-        let group_size_ba = 2 * v_per_group;
-        let mixed_ba = mixed_ba.reshape((batch_size, seq_len, self.num_k_heads, group_size_ba))?;
-
-        // Split within each group
-        let mut offset = 0;
-        let q = mixed_qkvz.narrow(D::Minus1, offset, self.head_k_dim)?;
-        offset += self.head_k_dim;
-        let k = mixed_qkvz.narrow(D::Minus1, offset, self.head_k_dim)?;
-        offset += self.head_k_dim;
-        let v = mixed_qkvz.narrow(D::Minus1, offset, v_per_group * self.head_v_dim)?;
-        offset += v_per_group * self.head_v_dim;
-        let z = mixed_qkvz.narrow(D::Minus1, offset, v_per_group * self.head_v_dim)?;
-
-        let b = mixed_ba.narrow(D::Minus1, 0, v_per_group)?;
-        let a = mixed_ba.narrow(D::Minus1, v_per_group, v_per_group)?;
-
-        // Reshape v, z from (batch, seq, num_k_heads, v_per_group*head_v_dim) -> (batch, seq, num_v_heads, head_v_dim)
-        let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
-        let z = z.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
-
-        // Reshape b, a from (batch, seq, num_k_heads, v_per_group) -> (batch, seq, num_v_heads)
-        let b = b.reshape((batch_size, seq_len, self.num_v_heads))?;
-        let a = a.reshape((batch_size, seq_len, self.num_v_heads))?;
-
-        // Flatten q, k, v back to last dim for conv: (batch, seq, key_dim), (batch, seq, key_dim), (batch, seq, value_dim)
-        let q = q.reshape((batch_size, seq_len, self.key_dim))?;
-        let k = k.reshape((batch_size, seq_len, self.key_dim))?;
-        let v_flat = v.reshape((batch_size, seq_len, self.value_dim))?;
-
-        // 3. Concatenate q, k, v for conv1d: (batch, seq, conv_dim)
-        let mixed_qkv = Tensor::cat(&[&q, &k, &v_flat], D::Minus1)?;
-
-        // 4. Apply causal conv1d (includes silu activation)
-        let mixed_qkv = if cache.seqlen_offset > 0 && seq_len == 1 {
-            self.causal_conv1d_update(&mixed_qkv, cache)?
-        } else {
-            self.causal_conv1d_full(&mixed_qkv, cache)?
-        };
-
-        // 5. Split back after conv and reshape to per-head
-        let q = mixed_qkv.narrow(D::Minus1, 0, self.key_dim)?;
-        let k = mixed_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
-        let v = mixed_qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
-
-        let q = q.reshape((batch_size, seq_len, self.num_k_heads, self.head_k_dim))?;
-        let k = k.reshape((batch_size, seq_len, self.num_k_heads, self.head_k_dim))?;
-        let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
-
-        // 6. Compute beta and g (3D: batch, seq, num_v_heads)
-        let (beta, g) = {
-            #[cfg(feature = "cuda")]
-            {
-                if b.device().is_cuda() {
-                    // CUDA fast path: fused sigmoid(b) and -exp(a_log)*softplus(a+dt_bias)
-                    let b_flat = b.contiguous()?.flatten_all()?;
-                    let a_flat = a.contiguous()?.flatten_all()?;
-                    let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
-                    let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
-                    let (beta_flat, g_flat) = crate::cuda::gdn::fused_gdn_gating_cuda(
-                        &b_flat,
-                        &a_flat,
-                        &a_log_f32,
-                        &dt_bias_f32,
-                    )?;
-                    let shape = b.shape();
-                    (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
-                } else {
-                    let beta = candle_nn::ops::sigmoid(&b)?;
-                    let a_f = a.to_dtype(DType::F32)?;
-                    let dt_bias_expanded = self
-                        .dt_bias
-                        .to_dtype(DType::F32)?
-                        .unsqueeze(0)?
-                        .unsqueeze(0)?;
-                    let g = self
-                        .a_log
-                        .to_dtype(DType::F32)?
-                        .exp()?
-                        .neg()?
-                        .unsqueeze(0)?
-                        .unsqueeze(0)?
-                        .broadcast_mul(&softplus(&a_f.broadcast_add(&dt_bias_expanded)?)?)?
-                        .to_dtype(dtype)?;
-                    (beta, g)
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let beta = candle_nn::ops::sigmoid(&b)?;
-                let a_f = a.to_dtype(DType::F32)?;
-                let dt_bias_expanded = self
-                    .dt_bias
-                    .to_dtype(DType::F32)?
-                    .unsqueeze(0)?
-                    .unsqueeze(0)?;
-                let g = self
-                    .a_log
-                    .to_dtype(DType::F32)?
-                    .exp()?
-                    .neg()?
-                    .unsqueeze(0)?
-                    .unsqueeze(0)?
-                    .broadcast_mul(&softplus(&a_f.broadcast_add(&dt_bias_expanded)?)?)?
-                    .to_dtype(dtype)?;
-                (beta, g)
-            }
-        };
-
-        // 7. If num_v_heads > num_k_heads, repeat_interleave q and k
-        let (q, k) = if v_per_group > 1 {
-            // repeat_interleave along head dim
-            let q = q
-                .unsqueeze(3)?
-                .repeat((1, 1, 1, v_per_group, 1))?
-                .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
-            let k = k
-                .unsqueeze(3)?
-                .repeat((1, 1, 1, v_per_group, 1))?
-                .reshape((batch_size, seq_len, self.num_v_heads, self.head_k_dim))?;
-            (q, k)
-        } else {
-            (q, k)
-        };
-
-        // 8. L2-normalize q and k
-        let q = l2_norm(&q, 1e-6)?;
-        let k = l2_norm(&k, 1e-6)?;
-
-        // 9. Apply recurrence
-        let y = {
-            #[cfg(feature = "cuda")]
-            {
-                if q.device().is_cuda() {
-                    // CUDA fast path: reshape (B,S,H,D) -> (B*H,S,D) for the kernel
-                    let num_heads = self.num_v_heads;
-                    let k_head = self.head_k_dim;
-                    let v_head = self.head_v_dim;
-                    let scale = 1.0 / (k_head as f64).sqrt();
-
-                    let q_bh = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?
-                        .reshape((batch_size * num_heads, seq_len, k_head))?
-                        .contiguous()?;
-                    let k_bh = k
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .to_dtype(DType::F32)?
-                        .reshape((batch_size * num_heads, seq_len, k_head))?
-                        .contiguous()?;
-                    let v_bh = v
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .to_dtype(DType::F32)?
-                        .reshape((batch_size * num_heads, seq_len, v_head))?
-                        .contiguous()?;
-                    let g_bh = g
-                        .to_dtype(DType::F32)?
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .reshape((batch_size * num_heads, seq_len))?
-                        .contiguous()?;
-                    let beta_bh = beta
-                        .to_dtype(DType::F32)?
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .reshape((batch_size * num_heads, seq_len))?
-                        .contiguous()?;
-
-                    // State: (B, H, K, V) -> (B*H, K, V) for kernel
-                    let mut state_flat = cache
-                        .recurrent_state
-                        .to_dtype(DType::F32)?
-                        .reshape((batch_size * num_heads, k_head, v_head))?
-                        .contiguous()?;
-
-                    let out_bh = crate::cuda::gdn::gated_delta_rule_recurrence_cuda(
-                        &q_bh,
-                        &k_bh,
-                        &v_bh,
-                        &g_bh,
-                        &beta_bh,
-                        &mut state_flat,
-                    )?;
-
-                    // Write state back: (B*H, K, V) -> (B, H, K, V)
-                    cache.recurrent_state = state_flat
-                        .reshape((batch_size, num_heads, k_head, v_head))?
-                        .to_dtype(cache.recurrent_state.dtype())?;
-
-                    // Output: (B*H, S, V) -> (B, H, S, V) -> (B, S, H, V)
-                    out_bh
-                        .reshape((batch_size, num_heads, seq_len, v_head))?
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .to_dtype(dtype)?
-                } else {
-                    gated_delta_rule_recurrence(&q, &k, &v, &g, &beta, &mut cache.recurrent_state)?
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                gated_delta_rule_recurrence(&q, &k, &v, &g, &beta, &mut cache.recurrent_state)?
-            }
-        };
-
-        cache.seqlen_offset += seq_len;
-
-        // y: (batch, seq, num_v_heads, head_v_dim)
-        let z_shape = z.shape().clone();
-
-        // 10. Apply RMSNormGated: flatten to 2D, apply norm with z as gate, reshape back
-        let y = y.reshape(((), self.head_v_dim))?;
-        let z = z.reshape(((), self.head_v_dim))?;
-        let y = self.norm.forward(&y, &z)?;
-        let y = y.reshape(z_shape)?;
-        let y = y.reshape((batch_size, seq_len, self.value_dim))?;
-
-        // 11. Output projection
-        let original_dtype = x.dtype();
-        let mut y_proj = y;
-        if let Some(t) = self.out_proj.quantized_act_type() {
-            y_proj = y_proj.to_dtype(t)?;
-        }
-        let mut res = MatMul.qmethod_matmul(&y_proj, &*self.out_proj)?;
-        if self.out_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
-        Ok(res)
+    fn linear_key_head_dim(&self) -> usize {
+        self.linear_key_head_dim
     }
 
-    /// Single-step causal conv1d update for decode.
-    /// Reference: torch_causal_conv1d_update
-    /// Input x: (batch, 1, conv_dim), output: (batch, 1, conv_dim)
-    fn causal_conv1d_update(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
-        let (_batch, seq_len, _conv_dim) = x.dims3()?;
-        // Transpose to (batch, conv_dim, seq_len)
-        let x_t = x.transpose(1, 2)?.contiguous()?;
-
-        #[cfg(feature = "cuda")]
-        if x_t.device().is_cuda() {
-            let weight = self
-                .conv1d_weight
-                .squeeze(1)?
-                .to_dtype(x_t.dtype())?
-                .contiguous()?;
-            let conv_state = cache.conv_state.contiguous()?;
-            let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
-                &x_t,
-                &weight,
-                &conv_state,
-                self.conv_kernel_size,
-                true,
-            )?;
-            cache.conv_state = new_conv_state;
-            return output.transpose(1, 2);
-        }
-
-        // CPU/Metal fallback
-        let state_len = cache.conv_state.dim(2)?;
-        let hidden_new = Tensor::cat(&[cache.conv_state.clone(), x_t], 2)?;
-        let new_len = hidden_new.dim(2)?;
-        cache.conv_state = hidden_new.narrow(2, new_len - state_len, state_len)?;
-
-        let weight = self
-            .conv1d_weight
-            .squeeze(1)?
-            .to_dtype(hidden_new.dtype())?;
-        let mut conv_outputs = Vec::with_capacity(seq_len);
-        let total_len = hidden_new.dim(2)?;
-        for i in (total_len - seq_len)..total_len {
-            let window =
-                hidden_new.narrow(2, i + 1 - self.conv_kernel_size, self.conv_kernel_size)?;
-            let out = (window * weight.unsqueeze(0)?)?.sum(D::Minus1)?;
-            conv_outputs.push(out);
-        }
-        let out = Tensor::stack(&conv_outputs, 2)?;
-        let out = candle_nn::ops::silu(&out)?;
-        out.transpose(1, 2)
+    fn linear_value_head_dim(&self) -> usize {
+        self.linear_value_head_dim
     }
 
-    /// Full sequence causal conv1d for prefill.
-    /// Reference: F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
-    /// with conv state saved as: F.pad(mixed_qkv, (kernel-1 - seq_len, 0)) or last kernel-1 elements
-    /// Input x: (batch, seq, conv_dim), output: (batch, seq, conv_dim)
-    fn causal_conv1d_full(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
-        let (batch_size, seq_len, conv_dim) = x.dims3()?;
-        let x_t = x.transpose(1, 2)?.contiguous()?; // (batch, conv_dim, seq_len)
+    fn linear_conv_kernel_dim(&self) -> usize {
+        self.linear_conv_kernel_dim
+    }
 
-        #[cfg(feature = "cuda")]
-        if x_t.device().is_cuda() {
-            let weight = self
-                .conv1d_weight
-                .squeeze(1)?
-                .to_dtype(x_t.dtype())?
-                .contiguous()?;
-            let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
-                &x_t,
-                &weight,
-                &cache.conv_state,
-                self.conv_kernel_size,
-                false,
-            )?;
-            cache.conv_state = new_conv_state;
-            return output.transpose(1, 2);
-        }
-
-        // CPU/Metal fallback
-        let pad_width = self.conv_kernel_size.saturating_sub(seq_len);
-        cache.conv_state = if pad_width > 0 {
-            let zeros =
-                Tensor::zeros((batch_size, conv_dim, pad_width), x_t.dtype(), x_t.device())?;
-            Tensor::cat(&[zeros, x_t.clone()], 2)?
-        } else {
-            x_t.narrow(2, seq_len - self.conv_kernel_size, self.conv_kernel_size)?
-        };
-
-        let padded_t = Tensor::cat(
-            &[
-                Tensor::zeros(
-                    (batch_size, conv_dim, self.conv_kernel_size - 1),
-                    x_t.dtype(),
-                    x_t.device(),
-                )?,
-                x_t,
-            ],
-            2,
-        )?;
-
-        let weight = self.conv1d_weight.squeeze(1)?.to_dtype(padded_t.dtype())?;
-
-        let mut conv_outputs = Vec::with_capacity(seq_len);
-        for i in 0..seq_len {
-            let window = padded_t.narrow(2, i, self.conv_kernel_size)?;
-            let out = (window * weight.unsqueeze(0)?)?.sum(D::Minus1)?;
-            conv_outputs.push(out);
-        }
-        let out = Tensor::stack(&conv_outputs, 2)?;
-        let out = candle_nn::ops::silu(&out)?;
-        out.transpose(1, 2)
+    fn quantization_config(&self) -> &Option<QuantizedConfig> {
+        &self.quantization_config
     }
 }
 
 // ====================== Full Attention layer ======================
 
 #[allow(dead_code)]
-struct FullAttention {
-    q_proj: Arc<dyn QuantMethod>,
-    k_proj: Arc<dyn QuantMethod>,
-    v_proj: Arc<dyn QuantMethod>,
-    o_proj: Arc<dyn QuantMethod>,
-    q_norm: GemmaRmsNorm,
-    k_norm: GemmaRmsNorm,
+pub struct FullAttention {
+    pub q_proj: Arc<dyn QuantMethod>,
+    pub k_proj: Arc<dyn QuantMethod>,
+    pub v_proj: Arc<dyn QuantMethod>,
+    pub o_proj: Arc<dyn QuantMethod>,
+    pub q_norm: GemmaRmsNorm,
+    pub k_norm: GemmaRmsNorm,
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -781,7 +175,7 @@ struct FullAttention {
 
 impl FullAttention {
     #[allow(clippy::too_many_arguments)]
-    fn load(
+    pub fn load(
         vb: ShardedVarBuilder,
         cfg: &Config,
         mapper: &dyn DeviceMapper,
@@ -865,7 +259,7 @@ impl FullAttention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward(
+    pub fn forward(
         &self,
         x: &Tensor,
         attention_mask: &Option<Tensor>,
@@ -1002,15 +396,15 @@ impl FullAttention {
 
 /// Standard MLP for shared expert
 #[derive(Clone)]
-struct Mlp {
-    gate_proj: Arc<dyn QuantMethod>,
-    up_proj: Arc<dyn QuantMethod>,
-    down_proj: Arc<dyn QuantMethod>,
-    act_fn: crate::layers::Activation,
+pub struct Mlp {
+    pub gate_proj: Arc<dyn QuantMethod>,
+    pub up_proj: Arc<dyn QuantMethod>,
+    pub down_proj: Arc<dyn QuantMethod>,
+    pub act_fn: crate::layers::Activation,
 }
 
 impl Mlp {
-    fn new(
+    pub fn new(
         vb: ShardedVarBuilder,
         hidden_size: usize,
         intermediate_size: usize,
@@ -1050,7 +444,7 @@ impl Mlp {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let original_dtype = xs.dtype();
         let mut xs = xs.clone();
         if let Some(t) = self.gate_proj.quantized_act_type() {
@@ -1066,24 +460,24 @@ impl Mlp {
         Ok(res)
     }
 
-    fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
+    pub fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
         vec![&mut self.gate_proj, &mut self.up_proj, &mut self.down_proj]
     }
 }
 
 /// Sparse MoE block with shared expert and shared expert gate
-struct SparseMoeBlock {
-    gate: Linear,
-    experts: MoEExperts,
-    shared_expert: Mlp,
-    shared_expert_gate: Linear,
-    num_experts_per_tok: usize,
-    norm_topk_prob: bool,
+pub struct SparseMoeBlock {
+    pub gate: Linear,
+    pub experts: MoEExperts,
+    pub shared_expert: Mlp,
+    pub shared_expert_gate: Linear,
+    pub num_experts_per_tok: usize,
+    pub norm_topk_prob: bool,
 }
 
 impl SparseMoeBlock {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         cfg: &Config,
         vb: ShardedVarBuilder,
         mapper: &dyn DeviceMapper,
@@ -1091,6 +485,7 @@ impl SparseMoeBlock {
         loading_isq: bool,
         comm: &Arc<mistralrs_quant::Comm>,
         real_device: Device,
+        is_qwen3_5: bool,
     ) -> Result<Self> {
         let layer_device = mapper
             .device_for(layer_idx, false)
@@ -1104,12 +499,16 @@ impl SparseMoeBlock {
             vb.pp("gate").set_device(layer_device.clone()),
         )?;
 
-        let moe_cfg = MoEExpertsConfig {
-            num_experts: cfg.num_experts,
-            num_experts_per_tok: cfg.num_experts_per_tok,
-            hidden_size: cfg.hidden_size,
-            moe_intermediate_size: cfg.moe_intermediate_size,
-        };
+        let mut moe_cfg = MoEExpertsConfig::new(
+            cfg.num_experts,
+            cfg.num_experts_per_tok,
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+        );
+
+        if is_qwen3_5 {
+            moe_cfg = moe_cfg.with_layout(MoELayout::InterPacked);
+        }
 
         let experts = MoEExperts::new(
             &moe_cfg,
@@ -1150,7 +549,7 @@ impl SparseMoeBlock {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let xs_flat = xs.reshape(((), hidden_dim))?;
 
@@ -1190,7 +589,7 @@ impl SparseMoeBlock {
         y + shared_out
     }
 
-    fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
+    pub fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
         let mut layers = self.experts.get_isq_layers();
         layers.extend(self.shared_expert.get_isq_layers());
         layers
@@ -1271,7 +670,13 @@ struct LocalHybridCache {
 }
 
 impl LocalHybridCache {
-    fn new(layer_types: &[LayerType], cfg: &Config, device: &Device, dtype: DType) -> Result<Self> {
+    fn new(
+        layer_types: &[LayerType],
+        cfg: &Config,
+        device: &Device,
+        dtype: DType,
+        world_size: usize,
+    ) -> Result<Self> {
         let mut caches = Vec::with_capacity(layer_types.len());
         for lt in layer_types {
             match lt {
@@ -1284,7 +689,7 @@ impl LocalHybridCache {
                 }
                 LayerType::LinearAttention => {
                     caches.push(LocalLayerCache::LinearAttention(GdnLayerCache::new(
-                        cfg, dtype, device,
+                        cfg, dtype, device, world_size,
                     )?));
                 }
             }
@@ -1454,14 +859,16 @@ impl Model {
                         &comm,
                     )?)
                 }
-                LayerType::LinearAttention => LayerImpl::LinearAttention(GatedDeltaNet::load(
-                    vb_layer.clone(),
-                    cfg,
-                    &*mapper,
-                    i,
-                    normal_loading_metadata.loading_isq,
-                    &comm,
-                )?),
+                LayerType::LinearAttention => {
+                    LayerImpl::LinearAttention(GatedDeltaNet::load_qwen3next(
+                        vb_layer.clone(),
+                        cfg,
+                        &*mapper,
+                        i,
+                        normal_loading_metadata.loading_isq,
+                        &comm,
+                    )?)
+                }
             };
 
             // (1+weight) RMSNorm for layer norms
@@ -1484,6 +891,7 @@ impl Model {
                 normal_loading_metadata.loading_isq,
                 &comm,
                 normal_loading_metadata.real_device.clone(),
+                false,
             )?;
 
             layers.push(DecoderLayer {
@@ -1500,6 +908,7 @@ impl Model {
             cfg,
             &normal_loading_metadata.real_device,
             vb_m.dtype(),
+            mapper.get_comm_for(0)?.world_size(),
         )?));
 
         // Create pipeline hybrid cache config
@@ -1598,6 +1007,13 @@ impl Model {
                 LayerImpl::FullAttention(_) => {
                     if let LocalLayerCache::Attention(kv_cache) = &mut local_cache.caches[layer_idx]
                     {
+                        if metadata
+                            .as_ref()
+                            .map(|(_, meta)| meta.is_first_prompt_chunk)
+                            .unwrap_or(seqlen_offsets[0] == 0)
+                        {
+                            kv_cache.reset();
+                        }
                         let mask_for_layer = mask.as_ref().map(|m| m.get(x.device()).clone());
                         x = layer.forward_attention(
                             &x,
@@ -1615,7 +1031,11 @@ impl Model {
                     if let LocalLayerCache::LinearAttention(gdn_cache) =
                         &mut local_cache.caches[layer_idx]
                     {
-                        if seqlen_offsets[0] == 0 {
+                        if metadata
+                            .as_ref()
+                            .map(|(_, meta)| meta.is_first_prompt_chunk)
+                            .unwrap_or(seqlen_offsets[0] == 0)
+                        {
                             gdn_cache.reset()?;
                         }
                         x = layer.forward_linear(&x, gdn_cache)?;
@@ -1687,14 +1107,20 @@ impl IsqModel for Model {
                     uvb_l.pp("self_attn").pp("k_norm").add(&attn.k_norm);
                 }
                 LayerImpl::LinearAttention(gdn) => {
-                    uvb_l
-                        .pp("linear_attn")
-                        .pp("in_proj_qkvz")
-                        .add_tensor("weight", gdn.in_proj_qkvz.weight().clone());
-                    uvb_l
-                        .pp("linear_attn")
-                        .pp("in_proj_ba")
-                        .add_tensor("weight", gdn.in_proj_ba.weight().clone());
+                    if let GdnProjection::FusedQkvzBa {
+                        in_proj_qkvz,
+                        in_proj_ba,
+                    } = &gdn.projection
+                    {
+                        uvb_l
+                            .pp("linear_attn")
+                            .pp("in_proj_qkvz")
+                            .add_tensor("weight", in_proj_qkvz.unquant_weight_bias().unwrap().0);
+                        uvb_l
+                            .pp("linear_attn")
+                            .pp("in_proj_ba")
+                            .add_tensor("weight", in_proj_ba.unquant_weight_bias().unwrap().0);
+                    }
                     uvb_l
                         .pp("linear_attn")
                         .add_tensor("conv1d.weight", gdn.conv1d_weight.clone());

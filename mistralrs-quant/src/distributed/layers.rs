@@ -535,6 +535,80 @@ impl ColumnParallelLayer {
         }
         Ok(vec_layers)
     }
+
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new_merged_chunks(
+        in_dim: usize,
+        out_dim: usize,
+        chunks: Vec<usize>,
+        config: &Option<QuantizedConfig>,
+        comm: &Arc<crate::Comm>,
+        vb: ShardedVarBuilder,
+    ) -> Result<Vec<Arc<dyn QuantMethod>>> {
+        if chunks.is_empty() {
+            candle_core::bail!("`chunks` must not be empty");
+        }
+        let sum_chunks: usize = chunks.iter().sum();
+        if sum_chunks != out_dim {
+            candle_core::bail!("sum of chunk sizes ({sum_chunks}) must equal out_dim ({out_dim})");
+        }
+        if config.is_some() {
+            candle_core::bail!(
+                "new_merged_chunks does not support pre-quantized layers; use ISQ or non-merged loading"
+            );
+        }
+
+        let base_vb = vb.clone();
+        let vb = if should_apply_immediate_isq(&vb) {
+            vb.set_device(Device::Cpu)
+        } else {
+            vb
+        };
+
+        // Handle the case where the layer is dummy (no tensors)
+        if !vb.contains_tensor("weight") {
+            let mut vec_layers = Vec::with_capacity(chunks.len());
+            for _ in 0..chunks.len() {
+                let layer = <DummyLayer as QuantMethod>::new(QuantMethodConfig::Dummy)?;
+                vec_layers.push(Arc::new(layer) as Arc<dyn QuantMethod>);
+            }
+            return Ok(vec_layers);
+        }
+
+        let mut weight = vb.get_with_hints((out_dim, in_dim), "weight", Default::default())?;
+        weight = merge_lora_weights(&vb, weight, in_dim, out_dim, Default::default())?;
+
+        let rank = comm.rank();
+        let world_size = comm.world_size();
+        let mut chunk_start = 0usize;
+        let mut vec_layers = Vec::with_capacity(chunks.len());
+
+        for &chunk_size in &chunks {
+            if chunk_size % world_size != 0 {
+                candle_core::bail!(
+                    "chunk size {chunk_size} is not divisible by tensor parallel world_size {world_size}"
+                );
+            }
+            let local_chunk = chunk_size / world_size;
+            let ws = weight
+                .narrow(0, chunk_start, chunk_size)?
+                .narrow(0, rank * local_chunk, local_chunk)?
+                .contiguous()?;
+            chunk_start += chunk_size;
+
+            let layer = <UnquantLinear as QuantMethod>::new(QuantMethodConfig::Unquantized(
+                Linear::new(ws, None),
+            ))?;
+            let this_unquant = Arc::new(Self {
+                weight: Arc::new(layer),
+                bias: None,
+            });
+            let this: Arc<dyn QuantMethod> = apply_immediate_isq(this_unquant, base_vb.clone())?;
+            vec_layers.push(this);
+        }
+
+        Ok(vec_layers)
+    }
 }
 
 impl QuantMethod for ColumnParallelLayer {
@@ -1501,42 +1575,100 @@ impl FusedExperts {
                 }
 
                 // Load gate_up_proj FP8 tensor and scale
-                // Shape: [num_experts, hidden_size, intermediate_size * 2]
-                let gate_up_fp8 = experts_vb.get_with_hints_dtype(
+                // Try [num_experts, hidden_size, intermediate_size * 2], fallback to transposed
+                let (gate_up_fp8, gate_up_scale) = match experts_vb.get_with_hints_dtype(
                     (num_experts, hidden_size, moe_intermediate_size * 2),
                     "gate_up_proj",
                     Default::default(),
                     candle_core::DType::F8E4M3,
-                )?;
-                let gate_up_scale = experts_vb.get_with_hints_dtype(
-                    (
-                        num_experts,
-                        hidden_size.div_ceil(weight_block_size[0]),
-                        (moe_intermediate_size * 2).div_ceil(weight_block_size[1]),
-                    ),
-                    "gate_up_proj.weight_scale_inv",
-                    Default::default(),
-                    candle_core::DType::F32,
-                )?;
+                ) {
+                    Ok(w) => {
+                        let scale = experts_vb.get_with_hints_dtype(
+                            (
+                                num_experts,
+                                hidden_size.div_ceil(weight_block_size[0]),
+                                (moe_intermediate_size * 2).div_ceil(weight_block_size[1]),
+                            ),
+                            "gate_up_proj.weight_scale_inv",
+                            Default::default(),
+                            candle_core::DType::F32,
+                        )?;
+                        (w, scale)
+                    }
+                    Err(_) => {
+                        let w = experts_vb
+                            .get_with_hints_dtype(
+                                (num_experts, moe_intermediate_size * 2, hidden_size),
+                                "gate_up_proj",
+                                Default::default(),
+                                candle_core::DType::F8E4M3,
+                            )?
+                            .transpose(1, 2)?
+                            .contiguous()?;
+                        let scale = experts_vb
+                            .get_with_hints_dtype(
+                                (
+                                    num_experts,
+                                    (moe_intermediate_size * 2).div_ceil(weight_block_size[0]),
+                                    hidden_size.div_ceil(weight_block_size[1]),
+                                ),
+                                "gate_up_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?
+                            .transpose(1, 2)?
+                            .contiguous()?;
+                        (w, scale)
+                    }
+                };
 
                 // Load down_proj FP8 tensor and scale
-                // Shape: [num_experts, intermediate_size, hidden_size]
-                let down_fp8 = experts_vb.get_with_hints_dtype(
+                // Try [num_experts, intermediate_size, hidden_size], fallback to transposed
+                let (down_fp8, down_scale) = match experts_vb.get_with_hints_dtype(
                     (num_experts, moe_intermediate_size, hidden_size),
                     "down_proj",
                     Default::default(),
                     candle_core::DType::F8E4M3,
-                )?;
-                let down_scale = experts_vb.get_with_hints_dtype(
-                    (
-                        num_experts,
-                        moe_intermediate_size.div_ceil(weight_block_size[0]),
-                        hidden_size.div_ceil(weight_block_size[1]),
-                    ),
-                    "down_proj.weight_scale_inv",
-                    Default::default(),
-                    candle_core::DType::F32,
-                )?;
+                ) {
+                    Ok(w) => {
+                        let scale = experts_vb.get_with_hints_dtype(
+                            (
+                                num_experts,
+                                moe_intermediate_size.div_ceil(weight_block_size[0]),
+                                hidden_size.div_ceil(weight_block_size[1]),
+                            ),
+                            "down_proj.weight_scale_inv",
+                            Default::default(),
+                            candle_core::DType::F32,
+                        )?;
+                        (w, scale)
+                    }
+                    Err(_) => {
+                        let w = experts_vb
+                            .get_with_hints_dtype(
+                                (num_experts, hidden_size, moe_intermediate_size),
+                                "down_proj",
+                                Default::default(),
+                                candle_core::DType::F8E4M3,
+                            )?
+                            .transpose(1, 2)?
+                            .contiguous()?;
+                        let scale = experts_vb
+                            .get_with_hints_dtype(
+                                (
+                                    num_experts,
+                                    hidden_size.div_ceil(weight_block_size[0]),
+                                    moe_intermediate_size.div_ceil(weight_block_size[1]),
+                                ),
+                                "down_proj.weight_scale_inv",
+                                Default::default(),
+                                candle_core::DType::F32,
+                            )?
+                            .transpose(1, 2)?
+                            .contiguous()?;
+                        (w, scale)
+                    }
+                };
 
                 // Split gate_up into gate and up
                 let gate_fp8 = gate_up_fp8.narrow(2, 0, moe_intermediate_size)?;
@@ -1676,14 +1808,35 @@ impl FusedExperts {
             // GGUF/indexed_moe_forward expects:
             // - gate/up: [num_experts, intermediate_size, hidden_size] = [128, 768, 2048]
             // - down: [num_experts, hidden_size, intermediate_size] = [128, 2048, 768]
-            let gate_up_proj = experts_vb.get(
+            let gate_up_proj = match experts_vb.get_with_hints(
                 (num_experts, hidden_size, moe_intermediate_size * 2),
                 "gate_up_proj",
-            )?;
-            let down_proj_packed = experts_vb.get(
+                Shard::default(),
+            ) {
+                Ok(w) => w,
+                Err(_) => experts_vb
+                    .get(
+                        (num_experts, moe_intermediate_size * 2, hidden_size),
+                        "gate_up_proj",
+                    )?
+                    .transpose(1, 2)?
+                    .contiguous()?,
+            };
+
+            let down_proj_packed = match experts_vb.get_with_hints(
                 (num_experts, moe_intermediate_size, hidden_size),
                 "down_proj",
-            )?;
+                Shard::default(),
+            ) {
+                Ok(w) => w,
+                Err(_) => experts_vb
+                    .get(
+                        (num_experts, hidden_size, moe_intermediate_size),
+                        "down_proj",
+                    )?
+                    .transpose(1, 2)?
+                    .contiguous()?,
+            };
 
             // Split gate_up_proj into gate_proj and up_proj along the last dimension
             // gate_proj: [num_experts, hidden_size, intermediate_size]
