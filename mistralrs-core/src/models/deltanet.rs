@@ -64,6 +64,20 @@ impl RmsNormGated {
     }
 
     pub fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
+        // On Metal: use a single fused kernel that combines the 12-step Candle chain
+        //   (to_dtype ×3, silu, sqr, mean_keepdim, +eps, sqrt, div, mul ×2, to_dtype)
+        // into one cooperative GPU pass.
+        #[cfg(feature = "metal")]
+        if x.device().is_metal() {
+            return crate::metal::gdn::gdn_rms_norm_gated_metal(
+                x,
+                gate,
+                &self.weight,
+                self.eps,
+            );
+        }
+
+        // CPU / CUDA fallback:
         let dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?;
         let gate = candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?;
@@ -96,6 +110,10 @@ impl GdnLayerCache {
     ) -> Result<Self> {
         let conv_dim = cfg.linear_conv_dim() / world_size;
         let conv_state = Tensor::zeros((1, conv_dim, cfg.linear_conv_kernel_dim()), dtype, device)?;
+        // Store the recurrent state in F32 regardless of the model dtype.
+        // The recurrence kernel always runs in F32, so keeping the state in F32
+        // avoids two dtype-conversion kernels (BF16→F32, F32→BF16) on every
+        // decode step for every GDN layer (e.g. 28 round-trips for a 14-layer hybrid).
         let recurrent_state = Tensor::zeros(
             (
                 1,
@@ -103,7 +121,7 @@ impl GdnLayerCache {
                 cfg.linear_key_head_dim(),
                 cfg.linear_value_head_dim(),
             ),
-            dtype,
+            DType::F32,
             device,
         )?;
         Ok(Self {
@@ -134,6 +152,16 @@ impl Clone for GdnLayerCache {
 // ====================== GDN math functions ======================
 
 pub fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
+    // On Metal: use a single fused kernel that combines sqr → sum_keepdim →
+    // broadcast_add(eps) → sqrt → recip → broadcast_mul in one GPU pass.
+    // This reduces 6–8 GPU kernel dispatches to 1, saving ~196 dispatches
+    // per decode token (2 calls × 14 GDN layers × 7 saved kernels).
+    #[cfg(feature = "metal")]
+    if x.device().is_metal() {
+        return crate::metal::gdn::gdn_l2_norm_metal(x, eps as f32);
+    }
+
+    // CPU / CUDA fallback:
     let inv_norm = x
         .sqr()?
         .sum_keepdim(D::Minus1)?
@@ -237,6 +265,32 @@ pub enum GdnProjection {
     },
 }
 
+impl GdnProjection {
+    /// Return mutable references to every ISQ-quantisable projection weight.
+    pub fn isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
+        match self {
+            GdnProjection::FusedQkvzBa {
+                in_proj_qkvz,
+                in_proj_ba,
+            } => vec![in_proj_qkvz, in_proj_ba],
+            GdnProjection::SplitQkvZa {
+                in_proj_qkv,
+                in_proj_z,
+                in_proj_b,
+                in_proj_a,
+            } => vec![in_proj_qkv, in_proj_z, in_proj_b, in_proj_a],
+            GdnProjection::SplitQkvZaMerged {
+                in_proj_q,
+                in_proj_k,
+                in_proj_v,
+                in_proj_z,
+                in_proj_b,
+                in_proj_a,
+            } => vec![in_proj_q, in_proj_k, in_proj_v, in_proj_z, in_proj_b, in_proj_a],
+        }
+    }
+}
+
 // ====================== Gated Delta Net layer ======================
 
 /// Projected outputs from the GDN input projections.
@@ -273,6 +327,15 @@ pub struct GatedDeltaNet {
 }
 
 impl GatedDeltaNet {
+    /// Return mutable references to every quantisable weight in this GDN layer,
+    /// including all input projections.  Call this from the model's `get_layers()`
+    /// so that ISQ applies to input projections too (4× bandwidth reduction).
+    pub fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
+        let mut v = self.projection.isq_layers();
+        v.push(&mut self.out_proj);
+        v
+    }
+
     /// Load GDN layer with fused Qwen3Next projection (in_proj_qkvz + in_proj_ba).
     #[allow(dead_code)]
     pub fn load_qwen3next(
@@ -901,54 +964,125 @@ impl GatedDeltaNet {
                 let num_heads = self.num_v_heads;
                 let k_head = self.head_k_dim;
                 let v_head = self.head_v_dim;
-                let scale = 1.0 / (k_head as f64).sqrt();
+                // Scale is now applied inside the Metal kernel (fused into the q load),
+                // so we don't need a separate GPU multiply kernel.
+                let q_scale = (1.0 / (k_head as f64).sqrt()) as f32;
 
-                let q_bh = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?
-                    .reshape((batch_size * num_heads, seq_len, k_head))?
-                    .contiguous()?;
-                let k_bh = k
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .to_dtype(DType::F32)?
-                    .reshape((batch_size * num_heads, seq_len, k_head))?
-                    .contiguous()?;
-                let v_bh = v
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .to_dtype(DType::F32)?
-                    .reshape((batch_size * num_heads, seq_len, v_head))?
-                    .contiguous()?;
-                let g_bh = g
-                    .to_dtype(DType::F32)?
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .reshape((batch_size * num_heads, seq_len))?
-                    .contiguous()?;
-                let beta_bh = beta
-                    .to_dtype(DType::F32)?
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .reshape((batch_size * num_heads, seq_len))?
-                    .contiguous()?;
+                // Tensors arrive as (batch, seq, num_v_heads, head_dim).
+                // The kernel expects (batch*heads, seq, head_dim) = [BH, S, D].
+                //
+                // We use the typed recurrence kernel (gdn_recurrence_typed) which
+                // accepts native BF16/F16 input, eliminating 5 to_dtype(F32) GPU
+                // kernel dispatches per layer (= 70 per decode step for 14 layers).
+                //
+                // DECODE FAST PATH (seq_len==1):
+                //   (batch, 1, heads, dim) has the same memory layout as
+                //   (batch*heads, 1, dim) so we can reshape without transposing.
+                //
+                // PREFILL PATH (seq_len>1):
+                //   Must transpose(1,2) + contiguous() to reorder the strides.
+                let model_dtype = q.dtype();
+                let use_typed_kernel = matches!(model_dtype, DType::F16 | DType::BF16);
 
+                let (q_bh, k_bh, v_bh, g_bh, beta_bh) = if seq_len == 1 {
+                    // Pure-reshape fast path for decode (no GPU kernels at all).
+                    let q_bh =
+                        q.reshape((batch_size * num_heads, 1, k_head))?;
+                    let k_bh =
+                        k.reshape((batch_size * num_heads, 1, k_head))?;
+                    let v_bh =
+                        v.reshape((batch_size * num_heads, 1, v_head))?;
+                    let g_bh =
+                        g.reshape((batch_size * num_heads, 1))?;
+                    let beta_bh =
+                        beta.reshape((batch_size * num_heads, 1))?;
+                    (q_bh, k_bh, v_bh, g_bh, beta_bh)
+                } else if use_typed_kernel {
+                    // Prefill: transpose + contiguous only (no to_dtype).
+                    let q_bh = q
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len, k_head))?;
+                    let k_bh = k
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len, k_head))?;
+                    let v_bh = v
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len, v_head))?;
+                    let g_bh = g
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len))?;
+                    let beta_bh = beta
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len))?;
+                    (q_bh, k_bh, v_bh, g_bh, beta_bh)
+                } else {
+                    // F32 fallback: convert + transpose.
+                    let q_bh = q
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .to_dtype(DType::F32)?
+                        .reshape((batch_size * num_heads, seq_len, k_head))?;
+                    let k_bh = k
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .to_dtype(DType::F32)?
+                        .reshape((batch_size * num_heads, seq_len, k_head))?;
+                    let v_bh = v
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .to_dtype(DType::F32)?
+                        .reshape((batch_size * num_heads, seq_len, v_head))?;
+                    let g_bh = g
+                        .to_dtype(DType::F32)?
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len))?;
+                    let beta_bh = beta
+                        .to_dtype(DType::F32)?
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len))?;
+                    (q_bh, k_bh, v_bh, g_bh, beta_bh)
+                };
+
+                // recurrent_state is stored in F32 (see GdnLayerCache::new).
+                // to_dtype(F32) is a zero-cost Rust clone; reshape is a view.
                 let mut state_flat = cache
                     .recurrent_state
                     .to_dtype(DType::F32)?
-                    .reshape((batch_size * num_heads, k_head, v_head))?
-                    .contiguous()?;
+                    .reshape((batch_size * num_heads, k_head, v_head))?;
 
-                let out_bh = crate::metal::gdn::gated_delta_rule_recurrence_metal(
-                    &q_bh,
-                    &k_bh,
-                    &v_bh,
-                    &g_bh,
-                    &beta_bh,
-                    &mut state_flat,
-                )?;
+                let out_bh = if use_typed_kernel {
+                    crate::metal::gdn::gated_delta_rule_recurrence_metal_typed(
+                        &q_bh,
+                        &k_bh,
+                        &v_bh,
+                        &g_bh,
+                        &beta_bh,
+                        &mut state_flat,
+                        q_scale,
+                    )?
+                } else {
+                    crate::metal::gdn::gated_delta_rule_recurrence_metal(
+                        &q_bh,
+                        &k_bh,
+                        &v_bh,
+                        &g_bh,
+                        &beta_bh,
+                        &mut state_flat,
+                        q_scale,
+                    )?
+                };
 
-                cache.recurrent_state = state_flat
-                    .reshape((batch_size, num_heads, k_head, v_head))?
-                    .to_dtype(cache.recurrent_state.dtype())?;
+                // state_flat was updated in-place by the Metal kernel.
+                // Reshape back and store (already F32, no dtype conversion needed).
+                cache.recurrent_state =
+                    state_flat.reshape((batch_size, num_heads, k_head, v_head))?;
 
                 return out_bh
                     .reshape((batch_size, num_heads, seq_len, v_head))?

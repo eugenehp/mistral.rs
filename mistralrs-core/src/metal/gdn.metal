@@ -40,6 +40,7 @@ kernel void gdn_recurrence(
     constant uint&      seq_len [[buffer(7)]],
     constant uint&      k_dim   [[buffer(8)]],
     constant uint&      v_dim   [[buffer(9)]],
+    constant float&     q_scale [[buffer(10)]],       // 1/sqrt(k_dim); applied to q during load
     threadgroup float*  shared  [[threadgroup(0)]],   // 2 * k_dim floats
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]])
@@ -97,9 +98,9 @@ kernel void gdn_recurrence(
 
         float delta = (v_t - kv_mem) * beta_t;
 
-        // ---- Step B: cooperatively load q_t --------------------------------
+        // ---- Step B: cooperatively load q_t (scaled) -----------------------
         for (uint j = tid; j < K; j += GDN_BV) {
-            q_buf[j] = q_bh[t * K + j];
+            q_buf[j] = q_bh[t * K + j] * q_scale;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -121,6 +122,118 @@ kernel void gdn_recurrence(
     }
     // State is already fully written back to device memory in the loops above.
 }
+
+// ============================================================================
+// Kernel 1b: gdn_recurrence_typed
+//
+// Same algorithm as gdn_recurrence but accepts native-dtype (half/bfloat)
+// inputs for q, k, v, g, beta, converting to F32 at load time.
+// Eliminates 5 separate to_dtype(F32) GPU kernels per decode step per layer.
+//
+// q, k  : [BH, S, K]  in InT
+// v     : [BH, S, V]  in InT
+// g, beta: [BH, S]    in InT
+// state : [BH, K, V]  in float  — mutated in-place
+// output: [BH, S, V]  in float
+// ============================================================================
+template <typename InT>
+kernel void gdn_recurrence_typed_impl(
+    device const InT*   q       [[buffer(0)]],
+    device const InT*   k       [[buffer(1)]],
+    device const InT*   v       [[buffer(2)]],
+    device const InT*   g       [[buffer(3)]],
+    device const InT*   beta    [[buffer(4)]],
+    device float*       state   [[buffer(5)]],
+    device float*       output  [[buffer(6)]],
+    constant uint&      seq_len [[buffer(7)]],
+    constant uint&      k_dim   [[buffer(8)]],
+    constant uint&      v_dim   [[buffer(9)]],
+    constant float&     q_scale [[buffer(10)]],
+    threadgroup float*  shared  [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tpitg [[thread_position_in_threadgroup]])
+{
+    const uint v_tile = tgpig.x;
+    const uint bh     = tgpig.y;
+    const uint tid    = tpitg.x;
+    const uint v_idx  = v_tile * GDN_BV + tid;
+    const bool valid  = (v_idx < v_dim);
+
+    const uint K = k_dim;
+    const uint V = v_dim;
+
+    device const InT*  q_bh    = q    + bh * seq_len * K;
+    device const InT*  k_bh    = k    + bh * seq_len * K;
+    device const InT*  v_bh    = v    + bh * seq_len * V;
+    device const InT*  g_bh    = g    + bh * seq_len;
+    device const InT*  beta_bh = beta + bh * seq_len;
+    device float*      st_bh   = state  + bh * K * V;
+    device float*      out_bh  = output + bh * seq_len * V;
+
+    threadgroup float* k_buf = shared;
+    threadgroup float* q_buf = shared + K;
+
+    for (uint t = 0; t < seq_len; t++) {
+        for (uint j = tid; j < K; j += GDN_BV) {
+            k_buf[j] = float(k_bh[t * K + j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float decay  = valid ? exp(float(g_bh[t]))          : 1.0f;
+        float beta_t = valid ? float(beta_bh[t])             : 0.0f;
+        float v_t    = valid ? float(v_bh[t * V + v_idx])    : 0.0f;
+
+        float kv_mem = 0.0f;
+        if (valid) {
+            for (uint j = 0; j < K; j++) {
+                float s_j = st_bh[j * V + v_idx] * decay;
+                st_bh[j * V + v_idx] = s_j;
+                kv_mem = fma(s_j, k_buf[j], kv_mem);
+            }
+        }
+
+        float delta = (v_t - kv_mem) * beta_t;
+
+        for (uint j = tid; j < K; j += GDN_BV) {
+            q_buf[j] = float(q_bh[t * K + j]) * q_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float y_t = 0.0f;
+        if (valid) {
+            for (uint j = 0; j < K; j++) {
+                float s_j = fma(k_buf[j], delta, st_bh[j * V + v_idx]);
+                st_bh[j * V + v_idx] = s_j;
+                y_t = fma(s_j, q_buf[j], y_t);
+            }
+            out_bh[t * V + v_idx] = y_t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+#define INST_RECURRENCE_TYPED(T, suffix)                                            \
+    template [[host_name("gdn_recurrence_typed_" #suffix)]] [[kernel]] void         \
+    gdn_recurrence_typed_impl<T>(                                                   \
+        device const T*   q       [[buffer(0)]],                                    \
+        device const T*   k       [[buffer(1)]],                                    \
+        device const T*   v       [[buffer(2)]],                                    \
+        device const T*   g       [[buffer(3)]],                                    \
+        device const T*   beta    [[buffer(4)]],                                    \
+        device float*     state   [[buffer(5)]],                                    \
+        device float*     output  [[buffer(6)]],                                    \
+        constant uint&    seq_len [[buffer(7)]],                                    \
+        constant uint&    k_dim   [[buffer(8)]],                                    \
+        constant uint&    v_dim   [[buffer(9)]],                                    \
+        constant float&   q_scale [[buffer(10)]],                                   \
+        threadgroup float* shared [[threadgroup(0)]],                               \
+        uint3 tgpig [[threadgroup_position_in_grid]],                               \
+        uint3 tpitg [[thread_position_in_threadgroup]]);
+
+INST_RECURRENCE_TYPED(half,   half)
+#if __METAL_VERSION__ >= 310
+INST_RECURRENCE_TYPED(bfloat, bfloat)
+#endif
 
 // ============================================================================
 // Kernel 2: causal_conv1d_update  (decode path, one new token)
@@ -353,4 +466,166 @@ kernel void gdn_gating_impl(
 INST_GATING(half, half)
 #if __METAL_VERSION__ >= 310
 INST_GATING(bfloat, bfloat)
+#endif
+
+// ============================================================================
+// Kernel 5: gdn_l2_norm
+//
+// Fused L2-normalisation along the last dimension.
+// Replaces the Candle chain: sqr → sum_keepdim → broadcast_add(eps) → sqrt
+//                           → recip → broadcast_mul  (6-8 separate kernels)
+// with a single cooperative kernel.
+//
+// Layout: [N, D]  where each row (length D) is one vector to normalise.
+// All elements of one vector are handled by a single threadgroup.
+//
+// Grid        : (N, 1, 1)           one group per vector
+// Threadgroup : (TPG, 1, 1)         TPG = min(next_power_of_2(D), 64)
+// Shared mem  : (D + TPG) * float   vals[0..D) + sq_buf[0..TPG)
+// ============================================================================
+template <typename T>
+kernel void gdn_l2_norm_impl(
+    device const T*    x      [[buffer(0)]],
+    device       T*    y      [[buffer(1)]],
+    constant uint&     N      [[buffer(2)]],  // number of vectors
+    constant uint&     D      [[buffer(3)]],  // vector length (head_dim)
+    constant float&    eps    [[buffer(4)]],
+    threadgroup float* shared [[threadgroup(0)]],  // (D + TPG) floats
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]])
+{
+    if (gid >= N) return;
+
+    threadgroup float* vals   = shared;       // [0..D)
+    threadgroup float* sq_buf = shared + D;   // [D..D+tpg)
+
+    // Phase 1: load elements into threadgroup; accumulate partial ||x||^2
+    float partial_sq = 0.0f;
+    for (uint i = tid; i < D; i += tpg) {
+        float v = float(x[gid * D + i]);
+        vals[i] = v;
+        partial_sq += v * v;
+    }
+    sq_buf[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: tree-reduction of partial sums
+    for (uint s = tpg >> 1; s > 0; s >>= 1) {
+        if (tid < s) sq_buf[tid] += sq_buf[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 3: compute inv-norm and write normalised values
+    float inv_norm = rsqrt(sq_buf[0] + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < D; i += tpg) {
+        y[gid * D + i] = T(vals[i] * inv_norm);
+    }
+}
+
+#define INST_L2NORM(T, suffix)                                                      \
+    template [[host_name("gdn_l2_norm_" #suffix)]] [[kernel]] void                  \
+    gdn_l2_norm_impl<T>(                                                            \
+        device const T*    x      [[buffer(0)]],                                    \
+        device       T*    y      [[buffer(1)]],                                    \
+        constant uint&     N      [[buffer(2)]],                                    \
+        constant uint&     D      [[buffer(3)]],                                    \
+        constant float&    eps    [[buffer(4)]],                                    \
+        threadgroup float* shared [[threadgroup(0)]],                               \
+        uint gid [[threadgroup_position_in_grid]],                                  \
+        uint tid [[thread_position_in_threadgroup]],                                \
+        uint tpg [[threads_per_threadgroup]]);
+
+INST_L2NORM(float,  float)
+INST_L2NORM(half,   half)
+#if __METAL_VERSION__ >= 310
+INST_L2NORM(bfloat, bfloat)
+#endif
+
+// ============================================================================
+// Kernel 6: gdn_rms_norm_gated
+//
+// Fused RMSNorm + SiLU-gate + weight scaling for the GDN output normalisation.
+// Replaces the 12-kernel Candle chain in RmsNormGated::forward:
+//   x→F32, gate→F32, silu(gate), sqr(x), mean_keepdim, +eps, sqrt,
+//   broadcast_div, weight→F32, broadcast_mul(weight), broadcast_mul(gate), →dtype
+//
+// Computes:  out[i] = rms_norm(x[i]) * weight[i] * silu(gate[i])
+//   where rms_norm(x)[i] = x[i] / sqrt(mean(x^2) + eps)
+//
+// x, gate : [N, D]  in src dtype (F16 or BF16)
+// weight  : [D]     in F32
+// out     : [N, D]  in src dtype
+//
+// Grid        : (N, 1, 1)
+// Threadgroup : (TPG, 1, 1)   TPG = min(next_power_of_2(D), 64)
+// Shared mem  : (D + TPG) * float
+// ============================================================================
+template <typename T>
+kernel void gdn_rms_norm_gated_impl(
+    device const T*     x      [[buffer(0)]],
+    device const T*     gate   [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device       T*     out    [[buffer(3)]],
+    constant uint&      N      [[buffer(4)]],
+    constant uint&      D      [[buffer(5)]],
+    constant float&     eps    [[buffer(6)]],
+    threadgroup float*  shared [[threadgroup(0)]],  // (D + TPG) floats
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]])
+{
+    if (gid >= N) return;
+
+    threadgroup float* vals   = shared;      // x in F32 [D]
+    threadgroup float* sq_buf = shared + D;  // partial sq sums [tpg]
+
+    // Phase 1: load x[gid, :] into threadgroup, accumulate partial ||x||^2
+    float partial_sq = 0.0f;
+    for (uint i = tid; i < D; i += tpg) {
+        float v = float(x[gid * D + i]);
+        vals[i] = v;
+        partial_sq += v * v;
+    }
+    sq_buf[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: tree-reduce sq sums → mean sq
+    for (uint s = tpg >> 1; s > 0; s >>= 1) {
+        if (tid < s) sq_buf[tid] += sq_buf[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_rms = rsqrt(sq_buf[0] / float(D) + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 3: normalize, scale by weight, multiply by silu(gate)
+    for (uint i = tid; i < D; i += tpg) {
+        float g    = float(gate[gid * D + i]);
+        float silu = g / (1.0f + exp(-g));   // silu(x) = x * sigmoid(x)
+        float v    = vals[i] * inv_rms * weight[i] * silu;
+        out[gid * D + i] = T(v);
+    }
+}
+
+#define INST_RMS_NORM_GATED(T, suffix)                                              \
+    template [[host_name("gdn_rms_norm_gated_" #suffix)]] [[kernel]] void           \
+    gdn_rms_norm_gated_impl<T>(                                                     \
+        device const T*     x      [[buffer(0)]],                                   \
+        device const T*     gate   [[buffer(1)]],                                   \
+        device const float* weight [[buffer(2)]],                                   \
+        device       T*     out    [[buffer(3)]],                                   \
+        constant uint&      N      [[buffer(4)]],                                   \
+        constant uint&      D      [[buffer(5)]],                                   \
+        constant float&     eps    [[buffer(6)]],                                   \
+        threadgroup float*  shared [[threadgroup(0)]],                              \
+        uint gid [[threadgroup_position_in_grid]],                                  \
+        uint tid [[thread_position_in_threadgroup]],                                \
+        uint tpg [[threads_per_threadgroup]]);
+
+INST_RMS_NORM_GATED(float,  float)
+INST_RMS_NORM_GATED(half,   half)
+#if __METAL_VERSION__ >= 310
+INST_RMS_NORM_GATED(bfloat, bfloat)
 #endif

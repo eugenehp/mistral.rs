@@ -762,7 +762,13 @@ impl IsqModel for Model {
                     tensors.push((&mut attn.o_proj, Some(i)));
                 }
                 LayerImplVariant::LinearAttention(gdn) => {
-                    tensors.push((&mut gdn.out_proj, Some(i)));
+                    // Include ALL GDN projections (input + output) for ISQ.
+                    // Without this, the large in_proj_qkv / in_proj_z weights stay
+                    // in full BF16, causing 4× higher memory bandwidth per decode
+                    // step than the quantized attention layers.
+                    for m in gdn.get_isq_layers() {
+                        tensors.push((m, Some(i)));
+                    }
                 }
             }
             for m in layer.ffn.get_isq_layers() {

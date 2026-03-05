@@ -120,6 +120,117 @@ fn ms_buf_off<'a>(ms: &'a MetalStorage, t: &Tensor) -> (&'a Buffer, usize) {
 // Returns: output [BH, S, V] in F32.
 // ============================================================================
 
+/// Typed-input recurrence: accepts q/k/v/g/beta in native model dtype (BF16/F16).
+/// Eliminates 5 separate to_dtype(F32) GPU kernels per call.
+pub fn gated_delta_rule_recurrence_metal_typed(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    q_scale: f32,
+) -> Result<Tensor> {
+    let dtype = q.dtype();
+    let suffix = match dtype {
+        DType::F16 => "half",
+        DType::BF16 => "bfloat",
+        other => candle_core::bail!(
+            "gdn_recurrence_typed: unsupported input dtype {other:?}; use F32 variant"
+        ),
+    };
+
+    let (bh, seq_len, k_dim) = q.dims3()?;
+    let v_dim = v.dim(2)?;
+
+    // Acquire storage guards
+    let q_sg = q.storage_and_layout().0;
+    let k_sg = k.storage_and_layout().0;
+    let v_sg = v.storage_and_layout().0;
+    let g_sg = g.storage_and_layout().0;
+    let beta_sg = beta.storage_and_layout().0;
+    let state_sg = state.storage_and_layout().0;
+
+    let Storage::Metal(q_ms) = &*q_sg else {
+        candle_core::bail!("gdn_recurrence_typed: q must be Metal")
+    };
+    let Storage::Metal(k_ms) = &*k_sg else {
+        candle_core::bail!("gdn_recurrence_typed: k must be Metal")
+    };
+    let Storage::Metal(v_ms) = &*v_sg else {
+        candle_core::bail!("gdn_recurrence_typed: v must be Metal")
+    };
+    let Storage::Metal(g_ms) = &*g_sg else {
+        candle_core::bail!("gdn_recurrence_typed: g must be Metal")
+    };
+    let Storage::Metal(beta_ms) = &*beta_sg else {
+        candle_core::bail!("gdn_recurrence_typed: beta must be Metal")
+    };
+    let Storage::Metal(state_ms) = &*state_sg else {
+        candle_core::bail!("gdn_recurrence_typed: state must be Metal")
+    };
+
+    let device = q_ms.device();
+    let raw_device = device.metal_device();
+
+    let (q_buf, q_off) = ms_buf_off(q_ms, q);
+    let (k_buf, k_off) = ms_buf_off(k_ms, k);
+    let (v_buf, v_off) = ms_buf_off(v_ms, v);
+    let (g_buf, g_off) = ms_buf_off(g_ms, g);
+    let (beta_buf, beta_off) = ms_buf_off(beta_ms, beta);
+    let (state_buf, state_off) = ms_buf_off(state_ms, state);
+
+    let out_arc: Arc<Buffer> =
+        device.new_buffer(bh * seq_len * v_dim, DType::F32, "gdn_recurrence_typed_out")?;
+
+    let encoder = device.command_encoder()?;
+    encoder.set_label("gdn_recurrence_typed");
+
+    let name = format!("gdn_recurrence_typed_{suffix}");
+    let pipeline = get_pipeline(raw_device, &name)?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(q_buf), q_off);
+    encoder.set_buffer(1, Some(k_buf), k_off);
+    encoder.set_buffer(2, Some(v_buf), v_off);
+    encoder.set_buffer(3, Some(g_buf), g_off);
+    encoder.set_buffer(4, Some(beta_buf), beta_off);
+    encoder.set_buffer(5, Some(state_buf), state_off);
+    encoder.set_buffer(6, Some(&*out_arc), 0);
+
+    let sl = seq_len as u32;
+    let kd = k_dim as u32;
+    let vd = v_dim as u32;
+    set_bytes(&encoder, 7, &sl);
+    set_bytes(&encoder, 8, &kd);
+    set_bytes(&encoder, 9, &vd);
+    set_bytes(&encoder, 10, &q_scale);
+
+    encoder.set_threadgroup_memory_length(0, 2 * k_dim * core::mem::size_of::<f32>());
+
+    const BV: usize = 64;
+    let v_tiles = v_dim.div_ceil(BV);
+    encoder.dispatch_thread_groups(
+        MTLSize { width: v_tiles, height: bh, depth: 1 },
+        MTLSize { width: BV, height: 1, depth: 1 },
+    );
+
+    drop(encoder);
+    // State was updated in-place by the Metal kernel (buffer(5) is both input
+    // and output for the state). The caller's `state` tensor already points
+    // to the same Metal buffer and will see the updated values.
+
+    Ok(Tensor::from((
+        Storage::Metal(MetalStorage::new(
+            out_arc,
+            device.clone(),
+            bh * seq_len * v_dim,
+            DType::F32,
+        )),
+        Shape::from_dims(&[bh, seq_len, v_dim]),
+    )))
+}
+
 pub fn gated_delta_rule_recurrence_metal(
     q: &Tensor,
     k: &Tensor,
@@ -127,6 +238,7 @@ pub fn gated_delta_rule_recurrence_metal(
     g: &Tensor,
     beta: &Tensor,
     state: &mut Tensor,
+    q_scale: f32, // 1/sqrt(k_dim) — fused into q load inside the kernel
 ) -> Result<Tensor> {
     let (bh, seq_len, k_dim) = q.dims3()?;
     let v_dim = v.dim(2)?;
@@ -195,6 +307,7 @@ pub fn gated_delta_rule_recurrence_metal(
     set_bytes(&encoder, 7, &sl);
     set_bytes(&encoder, 8, &kd);
     set_bytes(&encoder, 9, &vd);
+    set_bytes(&encoder, 10, &q_scale);
 
     // Shared memory: 2 * k_dim floats
     encoder.set_threadgroup_memory_length(0, 2 * k_dim * core::mem::size_of::<f32>());
@@ -503,4 +616,171 @@ pub fn fused_gdn_gating_metal(
     ));
 
     Ok((beta, g))
+}
+
+// ============================================================================
+// Kernel 5: gdn_l2_norm_metal
+//
+// Single-dispatch fused L2-normalisation along the last dimension.
+// Replaces the 6–8 Candle kernel chain:
+//   sqr → sum_keepdim → broadcast_add(eps) → sqrt → recip → broadcast_mul
+// with a single cooperative Metal kernel.
+//
+// x: any shape [..., D] in F16 or BF16 (or F32), contiguous.
+// Returns: same shape, each last-dim slice L2-normalised.
+// ============================================================================
+pub fn gdn_l2_norm_metal(x: &Tensor, eps: f32) -> Result<Tensor> {
+    let dims = x.dims();
+    let d = *dims.last().unwrap();
+    let n: usize = dims[..dims.len() - 1].iter().product();
+    let dtype = x.dtype();
+
+    // Kernel supports F16, BF16, F32.
+    let suffix = match dtype {
+        DType::F16 => "half",
+        DType::BF16 => "bfloat",
+        DType::F32 => "float",
+        other => candle_core::bail!("gdn_l2_norm: unsupported dtype {other:?}"),
+    };
+
+    // Ensure contiguous so the kernel can use linear indexing.
+    let x = x.contiguous()?;
+    let (x_sg, _x_layout) = x.storage_and_layout();
+    let Storage::Metal(x_ms) = &*x_sg else {
+        candle_core::bail!("gdn_l2_norm: x must be on Metal device")
+    };
+
+    let device = x_ms.device();
+    let raw_device = device.metal_device();
+
+    let (x_buf, x_off) = ms_buf_off(x_ms, &x);
+
+    let out_arc: Arc<Buffer> = device.new_buffer(n * d, dtype, "gdn_l2_norm_out")?;
+
+    let encoder = device.command_encoder()?;
+    encoder.set_label("gdn_l2_norm");
+
+    let name = format!("gdn_l2_norm_{suffix}");
+    let pipeline = get_pipeline(raw_device, &name)?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(x_buf), x_off);
+    encoder.set_buffer(1, Some(&*out_arc), 0);
+
+    let nn = n as u32;
+    let dd = d as u32;
+    set_bytes(&encoder, 2, &nn);
+    set_bytes(&encoder, 3, &dd);
+    set_bytes(&encoder, 4, &eps);
+
+    // TPG = min(next_power_of_2(D), 64); must match kernel dispatch.
+    let tpg = d.next_power_of_two().min(64);
+    // Shared memory: vals[D] + sq_buf[tpg] floats.
+    let shared_bytes = (d + tpg) * core::mem::size_of::<f32>();
+    encoder.set_threadgroup_memory_length(0, shared_bytes);
+
+    encoder.dispatch_thread_groups(
+        MTLSize { width: n, height: 1, depth: 1 },
+        MTLSize { width: tpg, height: 1, depth: 1 },
+    );
+
+    drop(encoder);
+
+    Ok(Tensor::from((
+        Storage::Metal(MetalStorage::new(out_arc, device.clone(), n * d, dtype)),
+        Shape::from_dims(dims),
+    )))
+}
+
+// ============================================================================
+// Kernel 6: gdn_rms_norm_gated_metal
+//
+// Fused RMSNorm + SiLU-gate + weight scaling, replacing RmsNormGated::forward's
+// 12-kernel chain with a single cooperative Metal kernel per call.
+//
+// x, gate : any shape [..., D] in F16 or BF16, contiguous.
+// weight  : [D] in F32.
+// eps     : small constant (e.g. 1e-6).
+// Returns : same shape as x.
+// ============================================================================
+pub fn gdn_rms_norm_gated_metal(
+    x: &Tensor,
+    gate: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+) -> Result<Tensor> {
+    let dims = x.dims();
+    let d = *dims.last().unwrap();
+    let n: usize = dims[..dims.len() - 1].iter().product();
+    let dtype = x.dtype();
+
+    let suffix = match dtype {
+        DType::F16 => "half",
+        DType::BF16 => "bfloat",
+        DType::F32 => "float",
+        other => candle_core::bail!("gdn_rms_norm_gated: unsupported dtype {other:?}"),
+    };
+
+    let x = x.contiguous()?;
+    let gate = gate.contiguous()?;
+    // weight is always F32; make contiguous in case it's a view.
+    let weight = weight.to_dtype(DType::F32)?.contiguous()?;
+
+    let (x_sg, _) = x.storage_and_layout();
+    let (gate_sg, _) = gate.storage_and_layout();
+    let (weight_sg, _) = weight.storage_and_layout();
+
+    let Storage::Metal(x_ms) = &*x_sg else {
+        candle_core::bail!("gdn_rms_norm_gated: x must be on Metal")
+    };
+    let Storage::Metal(gate_ms) = &*gate_sg else {
+        candle_core::bail!("gdn_rms_norm_gated: gate must be on Metal")
+    };
+    let Storage::Metal(weight_ms) = &*weight_sg else {
+        candle_core::bail!("gdn_rms_norm_gated: weight must be on Metal")
+    };
+
+    let device = x_ms.device();
+    let raw_device = device.metal_device();
+
+    let (x_buf, x_off) = ms_buf_off(x_ms, &x);
+    let (gate_buf, gate_off) = ms_buf_off(gate_ms, &gate);
+    let (weight_buf, weight_off) = ms_buf_off(weight_ms, &weight);
+
+    let out_arc: Arc<Buffer> = device.new_buffer(n * d, dtype, "gdn_rms_norm_gated_out")?;
+
+    let encoder = device.command_encoder()?;
+    encoder.set_label("gdn_rms_norm_gated");
+
+    let name = format!("gdn_rms_norm_gated_{suffix}");
+    let pipeline = get_pipeline(raw_device, &name)?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(x_buf), x_off);
+    encoder.set_buffer(1, Some(gate_buf), gate_off);
+    encoder.set_buffer(2, Some(weight_buf), weight_off);
+    encoder.set_buffer(3, Some(&*out_arc), 0);
+
+    let nn = n as u32;
+    let dd = d as u32;
+    let ep = eps as f32;
+    set_bytes(&encoder, 4, &nn);
+    set_bytes(&encoder, 5, &dd);
+    set_bytes(&encoder, 6, &ep);
+
+    let tpg = d.next_power_of_two().min(64);
+    let shared_bytes = (d + tpg) * core::mem::size_of::<f32>();
+    encoder.set_threadgroup_memory_length(0, shared_bytes);
+
+    encoder.dispatch_thread_groups(
+        MTLSize { width: n, height: 1, depth: 1 },
+        MTLSize { width: tpg, height: 1, depth: 1 },
+    );
+
+    drop(encoder);
+
+    Ok(Tensor::from((
+        Storage::Metal(MetalStorage::new(out_arc, device.clone(), n * d, dtype)),
+        Shape::from_dims(dims),
+    )))
 }
