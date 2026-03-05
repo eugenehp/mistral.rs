@@ -1,10 +1,13 @@
-# Qwen 3: [`collection`](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f)
+# Qwen 3 / Qwen 3.5: [`Qwen3 collection`](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f)
 
 The Qwen 3 family is a collection of hybrid reasoning MoE and non-MoE models ranging from 0.6b to 235b parameters.
+
+Qwen 3.5 (`Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM`) adds a hybrid full-attention + GatedDeltaNet linear-attention architecture and is also supported.
 
 ```bash
 mistralrs run --isq 4 -m Qwen/Qwen3-8B
 mistralrs run --isq 4 -m Qwen/Qwen3-30B-A3B
+mistralrs serve --isq 4 -p 1234 -m Qwen/Qwen3.5-9B
 ```
 
 > Note: mistral.rs can load all [FP8 pre-quantized versions](https://huggingface.co/Qwen/Qwen3-14B-FP8) natively! Simply replace the model ID.

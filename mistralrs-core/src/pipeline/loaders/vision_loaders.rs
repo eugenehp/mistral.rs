@@ -232,8 +232,8 @@ impl VisionLoaderType {
             "Gemma3nForConditionalGeneration" => Ok(Self::Gemma3n),
             "Qwen3VLForConditionalGeneration" => Ok(Self::Qwen3VL),
             "Qwen3VLMoeForConditionalGeneration" => Ok(Self::Qwen3VLMoE),
-            "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => Ok(Self::Qwen3_5VL),
-            "Qwen3_5ForConditionalGeneration" | "Qwen3_5ForCausalLM" => Ok(Self::Qwen3_5VL),
+            "Qwen3_5MoeForConditionalGeneration" => Ok(Self::Qwen3_5VL),
+            "Qwen3_5ForConditionalGeneration" => Ok(Self::Qwen3_5VL),
             "VoxtralForConditionalGeneration"
             | "VoxtralRealtimeForConditionalGeneration" => Ok(Self::Voxtral),
             other => anyhow::bail!(

@@ -981,7 +981,7 @@ impl Model {
     ) -> Result<Tensor> {
         let mut x = self.embed_tokens.forward(input_ids)?;
 
-        let mut local_cache = self.local_cache.lock().unwrap();
+        let mut local_cache = self.local_cache.lock().unwrap_or_else(|e| e.into_inner());
 
         let mask = CausalMasker.make_causal_mask_matrix(
             input_ids,

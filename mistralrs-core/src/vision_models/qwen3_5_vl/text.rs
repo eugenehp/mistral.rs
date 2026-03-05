@@ -136,7 +136,8 @@ impl DecoderLayer {
 
         let attn_out = match &self.layer_impl {
             LayerImpl::FullAttention(attn) => {
-                let kv_cache = kv_cache.expect("FullAttention needs kv_cache");
+                let kv_cache = kv_cache
+                    .ok_or_else(|| candle_core::Error::Msg("FullAttention layer received no kv_cache; cache/layer type mismatch".into()))?;
                 attn.forward(
                     &x,
                     attention_mask,
@@ -147,7 +148,8 @@ impl DecoderLayer {
                 )?
             }
             LayerImpl::LinearAttention(gdn) => {
-                let gdn_cache = gdn_cache.expect("LinearAttention needs gdn_cache");
+                let gdn_cache = gdn_cache
+                    .ok_or_else(|| candle_core::Error::Msg("LinearAttention layer received no gdn_cache; cache/layer type mismatch".into()))?;
                 gdn.forward(&x, gdn_cache)?
             }
         };
@@ -540,7 +542,7 @@ impl Qwen3_5VLTextModel {
         visual_pos_masks: Option<&Tensor>,
         deepstack_visual_embeds: Option<&[Tensor]>,
     ) -> Result<Tensor> {
-        let mut local_cache = self.local_cache.lock().unwrap();
+        let mut local_cache = self.local_cache.lock().unwrap_or_else(|e| e.into_inner());
 
         let is_first_chunk = metadata
             .as_ref()

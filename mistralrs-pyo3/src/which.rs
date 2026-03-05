@@ -31,6 +31,8 @@ pub enum Architecture {
     GraniteMoeHybrid,
     GptOss,
     Qwen3Next,
+    Qwen3_5,
+    Qwen3_5Moe,
 }
 
 impl From<Architecture> for NormalLoaderType {
@@ -57,6 +59,8 @@ impl From<Architecture> for NormalLoaderType {
             Architecture::GraniteMoeHybrid => Self::GraniteMoeHybrid,
             Architecture::GptOss => Self::GptOss,
             Architecture::Qwen3Next => Self::Qwen3Next,
+            Architecture::Qwen3_5 => Self::Qwen3_5,
+            Architecture::Qwen3_5Moe => Self::Qwen3_5Moe,
         }
     }
 }

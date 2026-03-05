@@ -650,6 +650,39 @@ impl Sampler {
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
+        // Guard against NaN / negative weights that would crash WeightedIndex.
+        // This can happen with aggressively quantised models (ISQ-4/ISQ-8).
+        // If any weight is invalid, fall back to argmax over the raw probs.
+        let any_invalid = probs.iter().any(|p| !p.is_finite() || *p < 0.0);
+        if any_invalid {
+            let best = probs
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let logprob = probs[best].log(10.0);
+            let top_logprobs = if return_logprobs {
+                Some(self.get_top_logprobs(probs)?)
+            } else {
+                None
+            };
+            let bytes = if let Some(tokenizer) = &self.tokenizer {
+                Some(
+                    tokenizer
+                        .decode(&[best.try_into().unwrap()], false)
+                        .map_err(|x| Error::Msg(x.to_string()))?,
+                )
+            } else {
+                None
+            };
+            return Ok(Logprobs {
+                token: best.try_into().unwrap(),
+                logprob,
+                top_logprobs,
+                bytes,
+            });
+        }
         let distr = WeightedIndex::new(probs).map_err(Error::wrap)?;
 
         let mut mut_ref_rng = &mut *rng.lock().expect("could not lock rng mutex");
@@ -912,6 +945,14 @@ impl Sampler {
         // }
 
         let logits = logits.to_vec1()?;
+        // Scrub NaN / ±inf from raw logits before any sampling path.
+        // ISQ-quantised models can occasionally emit bad logits; replacing
+        // them with a very large negative value (≈ zero probability) is
+        // safer than propagating NaN through softmax.
+        let logits: Vec<f32> = logits
+            .into_iter()
+            .map(|v: f32| if v.is_finite() { v } else { -1e9_f32 })
+            .collect();
         let mut logits = self.apply_penalties(logits, context)?;
         for processor in &self.logits_processors {
             logits = processor.apply(&logits, context)?;
