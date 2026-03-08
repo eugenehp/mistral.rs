@@ -6,6 +6,7 @@
 //! across all Qwen3 hybrid-attention models.
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
+use candle_nn::Linear;
 use mistralrs_quant::{QuantMethod, QuantizedConfig, RowParallelLayer, ShardedVarBuilder};
 use std::sync::Arc;
 
@@ -792,11 +793,55 @@ impl GatedDeltaNet {
                 comm,
                 vb_la.pp("in_proj_qkv"),
             )?;
-            GdnProjection::SplitQkvZa {
-                in_proj_qkv,
-                in_proj_z,
-                in_proj_b,
-                in_proj_a,
+
+            // ── Projection fusion (world_size == 1, unquantized weights) ────
+            //
+            // Fuse qkv + z + b + a into one contiguous weight matrix so that
+            // project_inputs() issues a single matmul instead of four.  This
+            // cuts ~3 Metal kernel dispatches per GDN layer per decode step.
+            //
+            // We only attempt fusion when all four weights are unquantized
+            // (i.e. plain BF16/F16/F32 tensors).  Quantized models (ISQ,
+            // GGUF, AWQ, …) fall back to the split layout unchanged.
+            let try_fuse = || -> Result<GdnProjection> {
+                let (w_qkv, _) = in_proj_qkv
+                    .unquant_weight_bias()
+                    .ok_or_else(|| candle_core::Error::Msg("not unquantized".into()))?;
+                let (w_z, _) = in_proj_z
+                    .unquant_weight_bias()
+                    .ok_or_else(|| candle_core::Error::Msg("not unquantized".into()))?;
+                let (w_b, _) = in_proj_b
+                    .unquant_weight_bias()
+                    .ok_or_else(|| candle_core::Error::Msg("not unquantized".into()))?;
+                let (w_a, _) = in_proj_a
+                    .unquant_weight_bias()
+                    .ok_or_else(|| candle_core::Error::Msg("not unquantized".into()))?;
+
+                // Stack rows: [qkv_out | value_dim | num_v_heads | num_v_heads] × hidden
+                let fused = candle_core::Tensor::cat(&[&w_qkv, &w_z, &w_b, &w_a], 0)?;
+                let qkv_end = w_qkv.dim(0)?;
+                let z_end = qkv_end + w_z.dim(0)?;
+                let b_end = z_end + w_b.dim(0)?;
+
+                let in_proj = mistralrs_quant::ReplicatedLayer::from_linear(
+                    Linear::new(fused, None),
+                )?;
+                Ok(GdnProjection::FusedAll {
+                    in_proj,
+                    qkv_end,
+                    z_end,
+                    b_end,
+                })
+            };
+
+            match try_fuse() {
+                Ok(proj) => proj,
+                Err(_) => GdnProjection::SplitQkvZa {
+                    in_proj_qkv,
+                    in_proj_z,
+                    in_proj_b,
+                    in_proj_a,
+                },
             }
         };
 
