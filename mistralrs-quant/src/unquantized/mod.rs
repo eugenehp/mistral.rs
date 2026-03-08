@@ -56,7 +56,22 @@ impl QuantMethod for UnquantLinear {
         // Batch matrix multiplication
         maybe_init_cublas_lt_wrapper(a.device().clone());
 
-        // Try custom GEMV for single-token decode (batch_size=1)
+        // ── Metal GEMV fast path ──────────────────────────────────────────
+        // For single-token decode (m ≤ 8) the weight matmul degenerates to a
+        // GEMV.  Candle's MLX GEMM allocates 32×32 tiles and wastes 31 of 32
+        // output rows.  Our custom kernel assigns one threadgroup per output
+        // element and achieves near-peak memory bandwidth for BF16/F16/F32.
+        #[cfg(feature = "metal")]
+        if crate::gemv::should_use_metal_gemv(a, &self.w) {
+            let y = crate::gemv::metal_gemv(a, &self.w)?;
+            return if let Some(b) = self.b.as_ref() {
+                y.broadcast_add(b)
+            } else {
+                Ok(y)
+            };
+        }
+
+        // ── CUDA GEMV fast path ───────────────────────────────────────────
         #[cfg(feature = "cuda")]
         if crate::gemv::should_use_gemv(a, &self.w) {
             return crate::gemv::gemv(a, &self.w, self.b.as_ref());

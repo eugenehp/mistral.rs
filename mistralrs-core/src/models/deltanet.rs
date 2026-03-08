@@ -1435,6 +1435,8 @@ impl GatedDeltaNet {
                     .reshape((batch_size * num_heads, k_head, v_head))?;
 
                 let out_bh = if use_typed_kernel {
+                    // Typed kernel outputs [B, S, H, V] in native dtype —
+                    // no reshape / transpose / contiguous / to_dtype needed.
                     crate::metal::gdn::gated_delta_rule_recurrence_metal_typed(
                         &q_bh,
                         &k_bh,
@@ -1443,8 +1445,10 @@ impl GatedDeltaNet {
                         &beta_bh,
                         &mut state_flat,
                         q_scale,
+                        num_heads,
                     )?
                 } else {
+                    // F32 kernel also outputs [B, S, H, V] — no transpose needed.
                     crate::metal::gdn::gated_delta_rule_recurrence_metal(
                         &q_bh,
                         &k_bh,
@@ -1453,19 +1457,16 @@ impl GatedDeltaNet {
                         &beta_bh,
                         &mut state_flat,
                         q_scale,
+                        num_heads,
                     )?
                 };
 
                 // state_flat was updated in-place by the Metal kernel.
-                // Reshape back and store (already F32, no dtype conversion needed).
                 cache.recurrent_state =
                     state_flat.reshape((batch_size, num_heads, k_head, v_head))?;
 
-                return out_bh
-                    .reshape((batch_size, num_heads, seq_len, v_head))?
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .to_dtype(dtype);
+                // out_bh is already [B, S, H, V] in the correct dtype.
+                return Ok(out_bh);
             }
         }
 
@@ -1540,45 +1541,55 @@ impl GatedDeltaNet {
     /// Single-step causal conv1d update for decode.
     fn causal_conv1d_update(&self, x: &Tensor, cache: &mut GdnLayerCache) -> Result<Tensor> {
         let (_batch, seq_len, _conv_dim) = x.dims3()?;
-        let x_t = x.transpose(1, 2)?.contiguous()?;
 
         #[cfg(feature = "cuda")]
-        if x_t.device().is_cuda() {
-            let weight = self
-                .conv1d_weight
-                .squeeze(1)?
-                .to_dtype(x_t.dtype())?
-                .contiguous()?;
-            let conv_state = cache.conv_state.contiguous()?;
-            let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
-                &x_t,
-                &weight,
-                &conv_state,
-                self.conv_kernel_size,
-                true,
-            )?;
-            cache.conv_state = new_conv_state;
-            return output.transpose(1, 2);
+        {
+            let x_t = x.transpose(1, 2)?.contiguous()?;
+            if x_t.device().is_cuda() {
+                let weight = self
+                    .conv1d_weight
+                    .squeeze(1)?
+                    .to_dtype(x_t.dtype())?
+                    .contiguous()?;
+                let conv_state = cache.conv_state.contiguous()?;
+                let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
+                    &x_t,
+                    &weight,
+                    &conv_state,
+                    self.conv_kernel_size,
+                    true,
+                )?;
+                cache.conv_state = new_conv_state;
+                return output.transpose(1, 2);
+            }
         }
 
         #[cfg(feature = "metal")]
-        if x_t.device().is_metal() {
+        if x.device().is_metal() {
+            // Pass x directly — the Metal kernel uses x_row_stride to read
+            // non-contiguous inputs (e.g. FusedAll narrow views) without a
+            // prior transpose+contiguous copy. The output comes back as
+            // [B, 1, conv_dim] (already correctly oriented).
             let weight = self
                 .conv1d_weight
                 .squeeze(1)?
-                .to_dtype(x_t.dtype())?
+                .to_dtype(x.dtype())?
                 .contiguous()?;
             let conv_state = cache.conv_state.contiguous()?;
             let (output, new_conv_state) = crate::metal::gdn::causal_conv1d_metal(
-                &x_t,
+                x,
                 &weight,
                 &conv_state,
                 self.conv_kernel_size,
                 true,
             )?;
             cache.conv_state = new_conv_state;
-            return output.transpose(1, 2);
+            // output is already [B, 1, conv_dim] — no transpose needed.
+            return Ok(output);
         }
+
+        // CPU / other fallback path.
+        let x_t = x.transpose(1, 2)?.contiguous()?;
 
         let state_len = cache.conv_state.dim(2)?;
         let hidden_new = Tensor::cat(&[cache.conv_state.clone(), x_t], 2)?;

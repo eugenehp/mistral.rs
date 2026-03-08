@@ -34,18 +34,19 @@ using namespace metal;
 #define GDN_MAX_K 256u
 
 kernel void gdn_recurrence(
-    device const float* q       [[buffer(0)]],
-    device const float* k       [[buffer(1)]],
-    device const float* v       [[buffer(2)]],
-    device const float* g       [[buffer(3)]],
-    device const float* beta    [[buffer(4)]],
-    device float*       state   [[buffer(5)]],
-    device float*       output  [[buffer(6)]],
-    constant uint&      seq_len [[buffer(7)]],
-    constant uint&      k_dim   [[buffer(8)]],
-    constant uint&      v_dim   [[buffer(9)]],
-    constant float&     q_scale [[buffer(10)]],       // 1/sqrt(k_dim); applied to q during load
-    threadgroup float*  shared  [[threadgroup(0)]],   // 2 * k_dim floats
+    device const float* q         [[buffer(0)]],
+    device const float* k         [[buffer(1)]],
+    device const float* v         [[buffer(2)]],
+    device const float* g         [[buffer(3)]],
+    device const float* beta      [[buffer(4)]],
+    device float*       state     [[buffer(5)]],
+    device float*       output    [[buffer(6)]],
+    constant uint&      seq_len   [[buffer(7)]],
+    constant uint&      k_dim     [[buffer(8)]],
+    constant uint&      v_dim     [[buffer(9)]],
+    constant float&     q_scale   [[buffer(10)]],
+    constant uint&      num_heads [[buffer(11)]],     // H; for [B,S,H,V] output layout
+    threadgroup float*  shared    [[threadgroup(0)]], // 2 * k_dim floats
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]])
 {
@@ -59,6 +60,10 @@ kernel void gdn_recurrence(
 
     const uint K = k_dim;
     const uint V = v_dim;
+    const uint H = num_heads;
+
+    const uint b_idx = bh / H;
+    const uint h_idx = bh % H;
 
     device const float* q_bh    = q    + bh * seq_len * K;
     device const float* k_bh    = k    + bh * seq_len * K;
@@ -66,7 +71,8 @@ kernel void gdn_recurrence(
     device const float* g_bh    = g    + bh * seq_len;
     device const float* beta_bh = beta + bh * seq_len;
     device float*       st_bh   = state  + bh * K * V;
-    device float*       out_bh  = output + bh * seq_len * V;
+    // Output in [B, S, H, V] layout: stride H*V per time step.
+    device float* out_row = output + b_idx * seq_len * H * V + h_idx * V;
 
     // Shared memory layout: k_buf[K] | q_buf[K]
     threadgroup float* k_buf = shared;
@@ -119,7 +125,7 @@ kernel void gdn_recurrence(
                 s[j] = fma(k_buf[j], delta, s[j]);
                 y_t  = fma(s[j], q_buf[j], y_t);
             }
-            out_bh[t * V + v_idx] = y_t;
+            out_row[t * H * V + v_idx] = y_t;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -145,20 +151,35 @@ kernel void gdn_recurrence(
 // state : [BH, K, V]  in float  — mutated in-place
 // output: [BH, S, V]  in float
 // ============================================================================
+// ── gdn_recurrence_typed_impl ────────────────────────────────────────────────
+//
+// Changes vs. the naive typed kernel:
+//   • output is InT (native dtype, not float) — eliminates the to_dtype(F32)
+//     dispatch after the recurrence call.
+//   • output layout is [B, S, H, V] — eliminates the transpose(1,2)+contiguous
+//     dispatch in the Rust return path.
+//   • num_heads is a new parameter (buffer 11) used to compute B and H from bh.
+//
+// The output global index for (bh, t, v_idx) is:
+//   b  = bh / num_heads
+//   h  = bh % num_heads
+//   out[b * S*H*V + t * H*V + h*V + v_idx]
+// ─────────────────────────────────────────────────────────────────────────────
 template <typename InT>
 kernel void gdn_recurrence_typed_impl(
-    device const InT*   q       [[buffer(0)]],
-    device const InT*   k       [[buffer(1)]],
-    device const InT*   v       [[buffer(2)]],
-    device const InT*   g       [[buffer(3)]],
-    device const InT*   beta    [[buffer(4)]],
-    device float*       state   [[buffer(5)]],
-    device float*       output  [[buffer(6)]],
-    constant uint&      seq_len [[buffer(7)]],
-    constant uint&      k_dim   [[buffer(8)]],
-    constant uint&      v_dim   [[buffer(9)]],
-    constant float&     q_scale [[buffer(10)]],
-    threadgroup float*  shared  [[threadgroup(0)]],
+    device const InT*   q         [[buffer(0)]],
+    device const InT*   k         [[buffer(1)]],
+    device const InT*   v         [[buffer(2)]],
+    device const InT*   g         [[buffer(3)]],
+    device const InT*   beta      [[buffer(4)]],
+    device float*       state     [[buffer(5)]],
+    device InT*         output    [[buffer(6)]],   // native dtype, [B,S,H,V] layout
+    constant uint&      seq_len   [[buffer(7)]],
+    constant uint&      k_dim     [[buffer(8)]],
+    constant uint&      v_dim     [[buffer(9)]],
+    constant float&     q_scale   [[buffer(10)]],
+    constant uint&      num_heads [[buffer(11)]],  // H; used to compute B, h from bh
+    threadgroup float*  shared    [[threadgroup(0)]],
     uint3 tgpig [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]])
 {
@@ -170,20 +191,25 @@ kernel void gdn_recurrence_typed_impl(
 
     const uint K = k_dim;
     const uint V = v_dim;
+    const uint H = num_heads;
+
+    // Decompose bh → batch b, head h for the [B, S, H, V] output layout.
+    const uint b_idx = bh / H;
+    const uint h_idx = bh % H;
 
     device const InT*  q_bh    = q    + bh * seq_len * K;
     device const InT*  k_bh    = k    + bh * seq_len * K;
     device const InT*  v_bh    = v    + bh * seq_len * V;
     device const InT*  g_bh    = g    + bh * seq_len;
     device const InT*  beta_bh = beta + bh * seq_len;
-    device float*      st_bh   = state  + bh * K * V;
-    device float*      out_bh  = output + bh * seq_len * V;
+    device float*      st_bh   = state + bh * K * V;
+    // Output row stride in the [B, S, H, V] layout: H*V elements per time step.
+    device InT*  out_row = output + b_idx * seq_len * H * V + h_idx * V;
 
     threadgroup float* k_buf = shared;
     threadgroup float* q_buf = shared + K;
 
     // Register-resident state: one column of [K, V] per thread.
-    // Eliminates O(T × K) device-memory traffic → O(K) load + O(K) store.
     float s[GDN_MAX_K];
     if (valid) {
         for (uint j = 0; j < K; j++)
@@ -196,9 +222,9 @@ kernel void gdn_recurrence_typed_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float decay  = valid ? exp(float(g_bh[t]))         : 1.0f;
-        float beta_t = valid ? float(beta_bh[t])            : 0.0f;
-        float v_t    = valid ? float(v_bh[t * V + v_idx])  : 0.0f;
+        float decay  = valid ? exp(float(g_bh[t]))        : 1.0f;
+        float beta_t = valid ? float(beta_bh[t])           : 0.0f;
+        float v_t    = valid ? float(v_bh[t * V + v_idx]) : 0.0f;
 
         float kv_mem = 0.0f;
         if (valid) {
@@ -221,12 +247,12 @@ kernel void gdn_recurrence_typed_impl(
                 s[j] = fma(k_buf[j], delta, s[j]);
                 y_t  = fma(s[j], q_buf[j], y_t);
             }
-            out_bh[t * V + v_idx] = y_t;
+            // Write directly into [B, S, H, V] position: stride H*V per time step.
+            out_row[t * H * V + v_idx] = InT(y_t);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write register state back to device memory once.
     if (valid) {
         for (uint j = 0; j < K; j++)
             st_bh[j * V + v_idx] = s[j];
@@ -236,18 +262,19 @@ kernel void gdn_recurrence_typed_impl(
 #define INST_RECURRENCE_TYPED(T, suffix)                                            \
     template [[host_name("gdn_recurrence_typed_" #suffix)]] [[kernel]] void         \
     gdn_recurrence_typed_impl<T>(                                                   \
-        device const T*   q       [[buffer(0)]],                                    \
-        device const T*   k       [[buffer(1)]],                                    \
-        device const T*   v       [[buffer(2)]],                                    \
-        device const T*   g       [[buffer(3)]],                                    \
-        device const T*   beta    [[buffer(4)]],                                    \
-        device float*     state   [[buffer(5)]],                                    \
-        device float*     output  [[buffer(6)]],                                    \
-        constant uint&    seq_len [[buffer(7)]],                                    \
-        constant uint&    k_dim   [[buffer(8)]],                                    \
-        constant uint&    v_dim   [[buffer(9)]],                                    \
-        constant float&   q_scale [[buffer(10)]],                                   \
-        threadgroup float* shared [[threadgroup(0)]],                               \
+        device const T*   q         [[buffer(0)]],                                  \
+        device const T*   k         [[buffer(1)]],                                  \
+        device const T*   v         [[buffer(2)]],                                  \
+        device const T*   g         [[buffer(3)]],                                  \
+        device const T*   beta      [[buffer(4)]],                                  \
+        device float*     state     [[buffer(5)]],                                  \
+        device T*         output    [[buffer(6)]],                                  \
+        constant uint&    seq_len   [[buffer(7)]],                                  \
+        constant uint&    k_dim     [[buffer(8)]],                                  \
+        constant uint&    v_dim     [[buffer(9)]],                                  \
+        constant float&   q_scale   [[buffer(10)]],                                 \
+        constant uint&    num_heads [[buffer(11)]],                                 \
+        threadgroup float* shared   [[threadgroup(0)]],                             \
         uint3 tgpig [[threadgroup_position_in_grid]],                               \
         uint3 tpitg [[thread_position_in_threadgroup]]);
 
@@ -268,14 +295,20 @@ INST_RECURRENCE_TYPED(bfloat, bfloat)
 // output     : [B, conv_dim]
 // ============================================================================
 
+// x_row_stride: the stride (in elements) between batches in the x buffer.
+// For a standard contiguous [B, conv_dim] input this equals conv_dim.
+// For a non-contiguous narrow view (e.g. from the FusedAll projection output
+// [B, 1, total_out_dim]), this equals total_out_dim — so the kernel can read
+// the correct channel for each batch without a prior transpose+contiguous copy.
 template <typename T>
 kernel void gdn_conv1d_update_impl(
-    device const T* x           [[buffer(0)]],
-    device const T* weight      [[buffer(1)]],
-    device T*       conv_state  [[buffer(2)]],
-    device T*       output      [[buffer(3)]],
-    constant uint&  conv_dim    [[buffer(4)]],
-    constant uint&  kernel_size [[buffer(5)]],
+    device const T* x             [[buffer(0)]],
+    device const T* weight        [[buffer(1)]],
+    device T*       conv_state    [[buffer(2)]],
+    device T*       output        [[buffer(3)]],
+    constant uint&  conv_dim      [[buffer(4)]],
+    constant uint&  kernel_size   [[buffer(5)]],
+    constant uint&  x_row_stride  [[buffer(6)]],
     uint2 gid [[thread_position_in_grid]])
 {
     const uint ch = gid.x;
@@ -285,13 +318,14 @@ kernel void gdn_conv1d_update_impl(
     device T*       cs = conv_state + (b * conv_dim + ch) * kernel_size;
     device const T* w  = weight + ch * kernel_size;
 
-    // Shift ring buffer left by 1, insert new token value at the end
+    // Shift ring buffer left by 1, insert new token value at the end.
     for (uint i = 0; i < kernel_size - 1; i++) {
         cs[i] = cs[i + 1];
     }
-    cs[kernel_size - 1] = x[b * conv_dim + ch];
+    // Read using the actual batch stride rather than assuming conv_dim.
+    cs[kernel_size - 1] = x[b * x_row_stride + ch];
 
-    // Dot product with weight, then SiLU
+    // Dot product with weight, then SiLU.
     float acc = 0.0f;
     for (uint i = 0; i < kernel_size; i++) {
         acc = fma(float(cs[i]), float(w[i]), acc);
@@ -303,12 +337,13 @@ kernel void gdn_conv1d_update_impl(
 #define INST_CONV1D_UPDATE(T, suffix)                                               \
     template [[host_name("gdn_conv1d_update_" #suffix)]] [[kernel]] void            \
     gdn_conv1d_update_impl<T>(                                                      \
-        device const T* x           [[buffer(0)]],                                  \
-        device const T* weight      [[buffer(1)]],                                  \
-        device T*       conv_state  [[buffer(2)]],                                  \
-        device T*       output      [[buffer(3)]],                                  \
-        constant uint&  conv_dim    [[buffer(4)]],                                  \
-        constant uint&  kernel_size [[buffer(5)]],                                  \
+        device const T* x             [[buffer(0)]],                                \
+        device const T* weight        [[buffer(1)]],                                \
+        device T*       conv_state    [[buffer(2)]],                                \
+        device T*       output        [[buffer(3)]],                                \
+        constant uint&  conv_dim      [[buffer(4)]],                                \
+        constant uint&  kernel_size   [[buffer(5)]],                                \
+        constant uint&  x_row_stride  [[buffer(6)]],                                \
         uint2 gid [[thread_position_in_grid]]);
 
 INST_CONV1D_UPDATE(float, float)

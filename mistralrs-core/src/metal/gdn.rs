@@ -130,6 +130,7 @@ pub fn gated_delta_rule_recurrence_metal_typed(
     beta: &Tensor,
     state: &mut Tensor,
     q_scale: f32,
+    num_heads: usize,
 ) -> Result<Tensor> {
     let dtype = q.dtype();
     let suffix = match dtype {
@@ -190,8 +191,11 @@ pub fn gated_delta_rule_recurrence_metal_typed(
     let (beta_buf, beta_off) = ms_buf_off(beta_ms, beta);
     let (state_buf, state_off) = ms_buf_off(state_ms, state);
 
+    // Output is now in native dtype (F16/BF16) and [B, S, H, V] layout,
+    // eliminating the to_dtype and transpose+contiguous dispatches in the caller.
+    let batch_size = bh / num_heads;
     let out_arc: Arc<Buffer> =
-        device.new_buffer(bh * seq_len * v_dim, DType::F32, "gdn_recurrence_typed_out")?;
+        device.new_buffer(bh * seq_len * v_dim, dtype, "gdn_recurrence_typed_out")?;
 
     let encoder = device.command_encoder()?;
     encoder.set_label("gdn_recurrence_typed");
@@ -211,10 +215,12 @@ pub fn gated_delta_rule_recurrence_metal_typed(
     let sl = seq_len as u32;
     let kd = k_dim as u32;
     let vd = v_dim as u32;
+    let nh = num_heads as u32;
     set_bytes(&encoder, 7, &sl);
     set_bytes(&encoder, 8, &kd);
     set_bytes(&encoder, 9, &vd);
     set_bytes(&encoder, 10, &q_scale);
+    set_bytes(&encoder, 11, &nh);
 
     encoder.set_threadgroup_memory_length(0, 2 * k_dim * core::mem::size_of::<f32>());
 
@@ -226,18 +232,17 @@ pub fn gated_delta_rule_recurrence_metal_typed(
     );
 
     drop(encoder);
-    // State was updated in-place by the Metal kernel (buffer(5) is both input
-    // and output for the state). The caller's `state` tensor already points
-    // to the same Metal buffer and will see the updated values.
 
+    // Output is already in [batch_size, seq_len, num_heads, v_dim] layout
+    // and native dtype — no transpose, contiguous, or to_dtype needed in caller.
     Ok(Tensor::from((
         Storage::Metal(MetalStorage::new(
             out_arc,
             device.clone(),
             bh * seq_len * v_dim,
-            DType::F32,
+            dtype,
         )),
-        Shape::from_dims(&[bh, seq_len, v_dim]),
+        Shape::from_dims(&[batch_size, seq_len, num_heads, v_dim]),
     )))
 }
 
@@ -248,7 +253,8 @@ pub fn gated_delta_rule_recurrence_metal(
     g: &Tensor,
     beta: &Tensor,
     state: &mut Tensor,
-    q_scale: f32, // 1/sqrt(k_dim) — fused into q load inside the kernel
+    q_scale: f32,
+    num_heads: usize,
 ) -> Result<Tensor> {
     let (bh, seq_len, k_dim) = q.dims3()?;
     let v_dim = v.dim(2)?;
@@ -300,7 +306,7 @@ pub fn gated_delta_rule_recurrence_metal(
     let (beta_buf, beta_off) = ms_buf_off(beta_ms, beta);
     let (state_buf, state_off) = ms_buf_off(state_ms, state);
 
-    // Allocate output
+    let batch_size = bh / num_heads;
     let out_arc: Arc<Buffer> =
         device.new_buffer(bh * seq_len * v_dim, DType::F32, "gdn_recurrence_out")?;
 
@@ -321,12 +327,13 @@ pub fn gated_delta_rule_recurrence_metal(
     let sl = seq_len as u32;
     let kd = k_dim as u32;
     let vd = v_dim as u32;
+    let nh = num_heads as u32;
     set_bytes(&encoder, 7, &sl);
     set_bytes(&encoder, 8, &kd);
     set_bytes(&encoder, 9, &vd);
     set_bytes(&encoder, 10, &q_scale);
+    set_bytes(&encoder, 11, &nh);
 
-    // Shared memory: 2 * k_dim floats
     encoder.set_threadgroup_memory_length(0, 2 * k_dim * core::mem::size_of::<f32>());
 
     const BV: usize = 64;
@@ -338,9 +345,7 @@ pub fn gated_delta_rule_recurrence_metal(
 
     drop(encoder);
 
-    // state buffer was modified in-place; the caller's `state` tensor still
-    // owns that buffer – no need to create a new tensor for it.
-
+    // Output is [batch_size, seq_len, num_heads, v_dim] F32 — no transpose needed.
     Ok(Tensor::from((
         Storage::Metal(MetalStorage::new(
             out_arc,
@@ -348,7 +353,7 @@ pub fn gated_delta_rule_recurrence_metal(
             bh * seq_len * v_dim,
             DType::F32,
         )),
-        Shape::from_dims(&[bh, seq_len, v_dim]),
+        Shape::from_dims(&[batch_size, seq_len, num_heads, v_dim]),
     )))
 }
 
@@ -395,11 +400,26 @@ pub fn causal_conv1d_metal(
     let (w_buf, w_off) = ms_buf_off(w_ms, weight);
 
     if is_update {
-        // x may be [B, C] or [B, C, 1]
+        // x may be [B, C], [B, C, 1], or [B, 1, C] (non-contiguous narrow).
+        // We derive (batch_size, conv_dim) from the dims and use the actual
+        // per-batch stride in memory (stride[0] of the tensor) so the kernel
+        // can read non-contiguous inputs without a prior transpose+contiguous copy.
         let dims = x.dims();
-        let (batch_size, conv_dim) = match dims.len() {
-            2 => (dims[0], dims[1]),
-            3 => (dims[0], dims[1]),
+        let (_x_storage, x_layout) = x.storage_and_layout();
+        let strides = x_layout.stride();
+        let (batch_size, conv_dim, x_row_stride) = match dims.len() {
+            2 => (dims[0], dims[1], strides[0]),
+            3 => {
+                // [B, C, 1] (transposed) or [B, 1, C] (from FusedAll narrow).
+                // conv_dim is the larger of the last two dims.
+                let (c, _s) = if dims[1] >= dims[2] {
+                    (dims[1], dims[2])
+                } else {
+                    (dims[2], dims[1])
+                };
+                // Row stride for batch: how many elements to skip per batch.
+                (dims[0], c, strides[0])
+            }
             _ => candle_core::bail!("causal_conv1d_update: bad x dims {:?}", dims),
         };
 
@@ -426,8 +446,10 @@ pub fn causal_conv1d_metal(
 
         let cd = conv_dim as u32;
         let ks = kernel_size as u32;
+        let xrs = x_row_stride as u32;
         set_bytes(&encoder, 4, &cd);
         set_bytes(&encoder, 5, &ks);
+        set_bytes(&encoder, 6, &xrs);
 
         let ch_groups = conv_dim.div_ceil(THREADS);
         encoder.dispatch_thread_groups(
@@ -437,11 +459,11 @@ pub fn causal_conv1d_metal(
 
         drop(encoder);
 
-        // conv_state buffer was updated in-place by the kernel.
-        // Return a clone of the existing tensor handle (same Arc<Buffer>,
-        // now containing updated data on the GPU timeline).
         let new_cs = conv_state.clone();
 
+        // Return output as [B, 1, conv_dim] — same memory layout as [B, conv_dim]
+        // but with strides [conv_dim, conv_dim, 1] which *is* contiguous for
+        // shape [B, 1, conv_dim]. This avoids the transpose(1,2) in the caller.
         let output = Tensor::from((
             Storage::Metal(MetalStorage::new(
                 out_arc,
@@ -449,7 +471,7 @@ pub fn causal_conv1d_metal(
                 batch_size * conv_dim,
                 dtype,
             )),
-            Shape::from_dims(&[batch_size, conv_dim, 1]),
+            Shape::from_dims(&[batch_size, 1, conv_dim]),
         ));
 
         Ok((output, new_cs))

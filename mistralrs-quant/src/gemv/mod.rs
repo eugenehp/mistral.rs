@@ -13,6 +13,12 @@
 #[cfg(feature = "cuda")]
 mod ffi;
 
+#[cfg(feature = "metal")]
+pub mod metal;
+
+#[cfg(feature = "metal")]
+pub use metal::{metal_gemv, should_use_metal_gemv};
+
 #[cfg(feature = "cuda")]
 use candle_core::{
     cuda::cudarc::driver::DevicePtr, CudaDevice, CudaStorage, DType, Result, Shape, Storage, Tensor,
