@@ -775,6 +775,30 @@ impl IsqModel for Qwen3_5VLTextModel {
                                 .pp("in_proj_ba")
                                 .add_tensor("weight", in_proj_ba.unquant_weight_bias().unwrap().0);
                         }
+                        GdnProjection::FusedAll {
+                            in_proj,
+                            qkv_end,
+                            z_end,
+                            b_end,
+                        } => {
+                            // Split fused weight back into checkpoint-named slices.
+                            if let Some((w, _)) = in_proj.unquant_weight_bias() {
+                                let total = w.dim(0).unwrap_or(0);
+                                let la = uvb_l.pp("linear_attn");
+                                if let Ok(w_qkv) = w.narrow(0, 0, *qkv_end) {
+                                    la.pp("in_proj_qkv").add_tensor("weight", w_qkv);
+                                }
+                                if let Ok(w_z) = w.narrow(0, *qkv_end, *z_end - *qkv_end) {
+                                    la.pp("in_proj_z").add_tensor("weight", w_z);
+                                }
+                                if let Ok(w_b) = w.narrow(0, *z_end, *b_end - *z_end) {
+                                    la.pp("in_proj_b").add_tensor("weight", w_b);
+                                }
+                                if let Ok(w_a) = w.narrow(0, *b_end, total - *b_end) {
+                                    la.pp("in_proj_a").add_tensor("weight", w_a);
+                                }
+                            }
+                        }
                     }
                     uvb_l
                         .pp("linear_attn")

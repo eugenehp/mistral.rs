@@ -150,13 +150,15 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        seq.responder()
+                        // Ignore send errors: the client may have already
+                        // disconnected, which is what caused the "channel
+                        // closed" model error in the first place.
+                        let _ = seq.responder()
                             .send(Response::ModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await
-                            .unwrap();
+                            .await;
                     } else {
                         let partial_completion_response = CompletionResponse {
                             id: seq.id().to_string(),
@@ -168,13 +170,12 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        seq.responder()
+                        let _ = seq.responder()
                             .send(Response::CompletionModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await
-                            .unwrap();
+                            .await;
                     }
                 }
                 for seq in $seq_slice.iter_mut() {

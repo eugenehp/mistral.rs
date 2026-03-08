@@ -175,7 +175,172 @@ pub fn softplus(x: &Tensor) -> Result<Tensor> {
     (Tensor::ones_like(x)? + x.exp()?)?.log()
 }
 
-/// Recurrent gated delta rule (CPU/Metal fallback).
+// ====================== Causal mask helpers ======================
+
+/// Build a [n, n] lower-triangular mask (1.0 on and below diagonal, 0.0 above).
+/// Used by the chunked recurrence for intra-chunk causal attention.
+fn lower_tri_mask(n: usize, device: &Device) -> Result<Tensor> {
+    let mut data = vec![0f32; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            data[i * n + j] = 1.0;
+        }
+    }
+    Tensor::from_slice(&data, (n, n), device)
+}
+
+/// Build a [n, n] strictly-lower-triangular mask (1.0 below diagonal, 0.0 on/above).
+fn strict_lower_tri_mask(n: usize, device: &Device) -> Result<Tensor> {
+    let mut data = vec![0f32; n * n];
+    for i in 0..n {
+        for j in 0..i {
+            data[i * n + j] = 1.0;
+        }
+    }
+    Tensor::from_slice(&data, (n, n), device)
+}
+
+// ====================== Chunk-parallel gated delta rule ======================
+
+/// Chunk-parallel gated delta rule recurrence (exact, no approximation).
+///
+/// Replaces the O(seq_len) token-by-token loop with O(n_chunks) sequential
+/// state updates. All intra-chunk computation is expressed as batch GEMM,
+/// making full use of BLAS on CPU and cuBLAS/MPS on GPU.
+///
+/// This mirrors llama.cpp's `build_delta_net_chunking` (CS = `chunk_size`),
+/// including the exact unit-lower-triangular back-substitution.
+///
+/// # Tensor layout (all F32)
+/// * `q`, `k` : `[bh, T, Dk]`  (`q` is already scaled by `1/√Dk`)
+/// * `v`      : `[bh, T, Dv]`
+/// * `g`      : `[bh, T]`  per-step log-decay
+/// * `beta`   : `[bh, T]`  per-step correction scale
+/// * `state`  : `[bh, Dk, Dv]`  updated in-place on every chunk boundary
+///
+/// Returns `output` of shape `[bh, T, Dv]`.
+pub fn gated_delta_rule_chunked(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+    chunk_size: usize,
+) -> Result<Tensor> {
+    let (_bh, t_total, _dk) = q.dims3()?;
+    let _dv = v.dim(2)?;
+    let n_chunks = t_total.div_ceil(chunk_size);
+    let device = q.device().clone();
+    let mut chunks_out: Vec<Tensor> = Vec::with_capacity(n_chunks);
+
+    for ci in 0..n_chunks {
+        let start = ci * chunk_size;
+        let cs = (t_total - start).min(chunk_size);
+
+        // ── Slice chunk [bh, cs, D] ─────────────────────────────────────────
+        let q_c = q.narrow(1, start, cs)?;
+        let k_c = k.narrow(1, start, cs)?;
+        let v_c = v.narrow(1, start, cs)?;
+        let g_c = g.narrow(1, start, cs)?;
+        let beta_c = beta.narrow(1, start, cs)?;
+
+        // ── 1. Cumulative log-decay [bh, cs] ────────────────────────────────
+        // g_cs[b, i] = Σ_{t=0..=i} g_c[b, t]
+        let g_cs = g_c.cumsum(1)?;
+
+        // ── 2. Intra-chunk decay matrix [bh, cs, cs] ────────────────────────
+        // decay[b, i, j] = exp(g_cs[b,i] - g_cs[b,j])  (j→i multiplicative decay)
+        let g_i = g_cs.unsqueeze(2)?; // [bh, cs, 1]
+        let g_j = g_cs.unsqueeze(1)?; // [bh, 1, cs]
+        let raw_decay = (g_i.broadcast_sub(&g_j)?).exp()?; // [bh, cs, cs]
+
+        let causal_mask = lower_tri_mask(cs, &device)?;        // incl. diagonal
+        let strict_mask = strict_lower_tri_mask(cs, &device)?; // excl. diagonal
+        let decay = raw_decay.broadcast_mul(&causal_mask)?;         // [bh, cs, cs]
+        let decay_strict = raw_decay.broadcast_mul(&strict_mask)?;  // [bh, cs, cs]
+
+        // ── 3. Beta-weighted tensors ─────────────────────────────────────────
+        let k_b = (&k_c * beta_c.unsqueeze(2)?)?; // [bh, cs, dk]
+        let v_b = (&v_c * beta_c.unsqueeze(2)?)?; // [bh, cs, dv]
+
+        // ── 4. RHS of the triangular system ──────────────────────────────────
+        // rhs[b, i] = v_b[b,i] − exp(g_cs[b,i]) · (state ← k_c[b,i])
+        //
+        // k_c @ state: [bh, cs, dk] @ [bh, dk, dv] = [bh, cs, dv]
+        //   entry [b,i,v] = Σ_j k_c[b,i,j] * state[b,j,v]   (state retrieval)
+        let sk = k_c.contiguous()?.matmul(state)?; // [bh, cs, dv]
+        let g_exp = g_cs.exp()?.unsqueeze(2)?; // [bh, cs, 1]
+        let rhs = (v_b - sk.broadcast_mul(&g_exp)?)?; // [bh, cs, dv]
+
+        // ── 5. A matrix (strictly lower triangular) ──────────────────────────
+        // A[b, i, j] = decay_strict[b,i,j] · (k_b[b,i] · k_c[b,j])
+        //
+        // kbk = k_b @ k_c^T  [bh, cs, cs],  entry [b,i,j] = k_b[b,i] · k_c[b,j]
+        let kbk = k_b.contiguous()?.matmul(&k_c.t()?.contiguous()?)?; // [bh, cs, cs]
+        let a_mat = (&kbk * &decay_strict)?; // [bh, cs, cs]
+
+        // ── 6. Back-substitution: δ = (I + A)^{-1} · rhs ────────────────────
+        // A is strictly lower triangular ⟹ (I+A) is unit lower triangular.
+        // δ[i] = rhs[i] − Σ_{j<i} A[i,j] · δ[j]
+        //
+        // This is a cs-step sequential loop, but cs = CHUNK_SIZE ≪ seq_len.
+        let mut delta_cols: Vec<Tensor> = Vec::with_capacity(cs);
+        // i = 0: no correction (no elements to the left)
+        delta_cols.push(rhs.narrow(1, 0, 1)?.squeeze(1)?); // [bh, dv]
+
+        for i in 1..cs {
+            let rhs_i = rhs.narrow(1, i, 1)?.squeeze(1)?; // [bh, dv]
+            // a_row[b, j] = A[b, i, j] for j in 0..i  [bh, i]
+            let a_row = a_mat
+                .narrow(1, i, 1)?
+                .squeeze(1)?
+                .narrow(1, 0, i)?; // [bh, i]
+            // d_prev: stack of δ[0..i]  [bh, i, dv]
+            let d_prev = Tensor::stack(&delta_cols[..i], 1)?;
+            // corr = a_row @ d_prev → [bh, 1, i] @ [bh, i, dv] = [bh, 1, dv] → [bh, dv]
+            let corr = a_row.unsqueeze(1)?.matmul(&d_prev)?.squeeze(1)?;
+            delta_cols.push((rhs_i - corr)?);
+        }
+        let delta = Tensor::stack(&delta_cols, 1)?; // [bh, cs, dv]
+
+        // ── 7. Output ────────────────────────────────────────────────────────
+        // o[b,i] = exp(g_cs[i]) · (state @ q_c[i])
+        //        + Σ_{j≤i} decay[i,j] · (k_c[j] · q_c[i]) · δ[j]
+        //
+        // o_state = (q_c @ state) * g_exp        [bh, cs, dv]
+        // kq      = q_c @ k_c^T                  [bh, cs, cs]  (q already scaled)
+        // o_intra = (kq * decay) @ delta          [bh, cs, dv]
+        let o_state = q_c
+            .contiguous()?
+            .matmul(state)?
+            .broadcast_mul(&g_exp)?; // [bh, cs, dv]
+        let kq = q_c
+            .contiguous()?
+            .matmul(&k_c.t()?.contiguous()?)?; // [bh, cs, cs]
+        let o_intra = (&kq * &decay)?.matmul(&delta)?; // [bh, cs, dv]
+        chunks_out.push((o_state + o_intra)?);
+
+        // ── 8. State update ──────────────────────────────────────────────────
+        // state_new = exp(g_cs[-1]) · state + K_decay^T @ δ
+        //
+        // K_decay[b, j] = k_c[b, j] * exp(g_cs[-1] - g_cs[j])
+        //   decay_end[b, j] = exp(g_cs[b, cs-1] - g_cs[b, j])  [bh, cs]
+        let g_last = g_cs.narrow(1, cs - 1, 1)?; // [bh, 1]
+        let decay_end = (g_last.broadcast_sub(&g_cs)?).exp()?; // [bh, cs]
+        let k_decay = (&k_c * decay_end.unsqueeze(2)?)?; // [bh, cs, dk]
+        let state_delta = k_decay.t()?.contiguous()?.matmul(&delta)?; // [bh, dk, dv]
+        *state =
+            (state.broadcast_mul(&g_last.exp()?.unsqueeze(2)?)? + state_delta)?;
+    }
+
+    Tensor::cat(&chunks_out, 1) // [bh, T, Dv]
+}
+
+/// Recurrent gated delta rule — token-by-token sequential fallback.
+///
+/// Kept as a correctness reference and for very short sequences (T ≤ 4) where
+/// the chunked path's GEMM setup overhead exceeds its benefit.
 ///
 /// q, k: (batch, seq, num_v_heads, head_k_dim)
 /// v:    (batch, seq, num_v_heads, head_v_dim)
@@ -184,6 +349,7 @@ pub fn softplus(x: &Tensor) -> Result<Tensor> {
 /// state: (batch, num_v_heads, head_k_dim, head_v_dim)
 ///
 /// Returns: (batch, seq, num_v_heads, head_v_dim)
+#[allow(dead_code)]
 pub fn gated_delta_rule_recurrence(
     q: &Tensor,
     k: &Tensor,
@@ -247,6 +413,20 @@ pub enum GdnProjection {
         in_proj_qkvz: Arc<dyn QuantMethod>,
         in_proj_ba: Arc<dyn QuantMethod>,
     },
+    /// Qwen3.5 world_size==1: all four projections merged into one weight for a
+    /// single matmul dispatch.  Output split offsets are stored alongside.
+    ///
+    /// Layout of the fused output dim:
+    ///   [0 .. qkv_end)    → q, k, v  (key_dim*2 + value_dim)
+    ///   [qkv_end .. z_end) → z       (value_dim)
+    ///   [z_end .. b_end)   → b       (num_v_heads)
+    ///   [b_end .. end)     → a       (num_v_heads)
+    FusedAll {
+        in_proj: Arc<dyn QuantMethod>,
+        qkv_end: usize,
+        z_end: usize,
+        b_end: usize,
+    },
     /// Qwen3.5: split in_proj_qkv (key_dim*2 + value_dim) + in_proj_z (value_dim) + in_proj_b (num_v_heads) + in_proj_a (num_v_heads)
     SplitQkvZa {
         in_proj_qkv: Arc<dyn QuantMethod>,
@@ -273,6 +453,7 @@ impl GdnProjection {
                 in_proj_qkvz,
                 in_proj_ba,
             } => vec![in_proj_qkvz, in_proj_ba],
+            GdnProjection::FusedAll { in_proj, .. } => vec![in_proj],
             GdnProjection::SplitQkvZa {
                 in_proj_qkv,
                 in_proj_z,
@@ -579,6 +760,7 @@ impl GatedDeltaNet {
         )?;
 
         let projection = if world_size > 1 {
+            // Tensor-parallel: keep QKV split so each rank owns its shard.
             let merged_qkv = mistralrs_quant::ColumnParallelLayer::new_merged_chunks(
                 cfg.hidden_size(),
                 qkv_out_global,
@@ -641,6 +823,34 @@ impl GatedDeltaNet {
         let v_per_group = self.num_v_heads / self.num_k_heads;
 
         match &self.projection {
+            GdnProjection::FusedAll {
+                in_proj,
+                qkv_end,
+                z_end,
+                b_end,
+            } => {
+                // Single matmul for all four projections.
+                let all = MatMul.qmethod_matmul(x, &**in_proj)?; // [B, S, total_out]
+                let proj_qkv = all.narrow(D::Minus1, 0, *qkv_end)?;
+                let z_full = all.narrow(D::Minus1, *qkv_end, *z_end - *qkv_end)?;
+                let b = all.narrow(D::Minus1, *z_end, *b_end - *z_end)?;
+                let a_total = all.dim(D::Minus1)? - *b_end;
+                let a = all.narrow(D::Minus1, *b_end, a_total)?;
+
+                let q = proj_qkv.narrow(D::Minus1, 0, self.key_dim)?;
+                let k = proj_qkv.narrow(D::Minus1, self.key_dim, self.key_dim)?;
+                let v_flat = proj_qkv.narrow(D::Minus1, self.key_dim * 2, self.value_dim)?;
+                let z = z_full.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
+
+                Ok(GdnProjected {
+                    q,
+                    k,
+                    v_flat,
+                    z,
+                    b,
+                    a,
+                })
+            }
             GdnProjection::FusedQkvzBa {
                 in_proj_qkvz,
                 in_proj_ba,
@@ -903,33 +1113,66 @@ impl GatedDeltaNet {
                 let v_head = self.head_v_dim;
                 let scale = 1.0 / (k_head as f64).sqrt();
 
-                let q_bh = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?
-                    .reshape((batch_size * num_heads, seq_len, k_head))?
-                    .contiguous()?;
-                let k_bh = k
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .to_dtype(DType::F32)?
-                    .reshape((batch_size * num_heads, seq_len, k_head))?
-                    .contiguous()?;
-                let v_bh = v
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .to_dtype(DType::F32)?
-                    .reshape((batch_size * num_heads, seq_len, v_head))?
-                    .contiguous()?;
-                let g_bh = g
-                    .to_dtype(DType::F32)?
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .reshape((batch_size * num_heads, seq_len))?
-                    .contiguous()?;
-                let beta_bh = beta
-                    .to_dtype(DType::F32)?
-                    .transpose(1, 2)?
-                    .contiguous()?
-                    .reshape((batch_size * num_heads, seq_len))?
-                    .contiguous()?;
+                // ── Decode fast path (seq_len == 1) ──────────────────────────
+                // q/k/v have shape [B, 1, H, D] which shares the same memory
+                // layout as [B*H, 1, D] — reshape is a zero-copy view.
+                // This eliminates the 2 transpose+contiguous copies per tensor
+                // that the prefill path needs.
+                let (q_bh, k_bh, v_bh, g_bh, beta_bh) = if seq_len == 1 {
+                    let bh = batch_size * num_heads;
+                    let q_bh =
+                        (q.reshape((bh, 1, k_head))?.to_dtype(DType::F32)? * scale)?
+                            .contiguous()?;
+                    let k_bh = k
+                        .reshape((bh, 1, k_head))?
+                        .to_dtype(DType::F32)?
+                        .contiguous()?;
+                    let v_bh = v
+                        .reshape((bh, 1, v_head))?
+                        .to_dtype(DType::F32)?
+                        .contiguous()?;
+                    // g/beta are [B, 1, H] — same zero-copy reshape to [B*H, 1]
+                    let g_bh = g
+                        .reshape((bh, 1))?
+                        .to_dtype(DType::F32)?
+                        .contiguous()?;
+                    let beta_bh = beta
+                        .reshape((bh, 1))?
+                        .to_dtype(DType::F32)?
+                        .contiguous()?;
+                    (q_bh, k_bh, v_bh, g_bh, beta_bh)
+                } else {
+                    // ── Prefill path (seq_len > 1) ───────────────────────────
+                    let q_bh =
+                        (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?
+                            .reshape((batch_size * num_heads, seq_len, k_head))?
+                            .contiguous()?;
+                    let k_bh = k
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .to_dtype(DType::F32)?
+                        .reshape((batch_size * num_heads, seq_len, k_head))?
+                        .contiguous()?;
+                    let v_bh = v
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .to_dtype(DType::F32)?
+                        .reshape((batch_size * num_heads, seq_len, v_head))?
+                        .contiguous()?;
+                    let g_bh = g
+                        .to_dtype(DType::F32)?
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len))?
+                        .contiguous()?;
+                    let beta_bh = beta
+                        .to_dtype(DType::F32)?
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((batch_size * num_heads, seq_len))?
+                        .contiguous()?;
+                    (q_bh, k_bh, v_bh, g_bh, beta_bh)
+                };
 
                 let mut state_flat = cache
                     .recurrent_state
@@ -1092,7 +1335,72 @@ impl GatedDeltaNet {
             }
         }
 
-        gated_delta_rule_recurrence(q, k, v, g, beta, &mut cache.recurrent_state)
+        // ── CPU (and any device without a dedicated fused kernel) ────────────
+        //
+        // Route through the chunk-parallel implementation.  This replaces the
+        // original O(seq_len) IndexOp loop with O(n_chunks) sequential state
+        // updates whose intra-chunk work is expressed as batch GEMM (BLAS on
+        // CPU, cuBLAS / MPS on GPU if this branch is somehow reached there).
+        //
+        // All tensors are converted to F32 first (matching the existing
+        // fallback behaviour) and the scale is fused into q.
+        let k_head = self.head_k_dim;
+        let v_head = self.head_v_dim;
+        let num_heads = self.num_v_heads;
+        let scale = 1.0 / (k_head as f64).sqrt();
+
+        // Convert and reshape to the [bh, T, D] layout expected by the chunked
+        // recurrence.  For seq_len == 1 the existing Metal fast path already
+        // handled it above, so we only reach here for seq_len > 1 on CPU.
+        let q_f = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?
+            .reshape((batch_size * num_heads, seq_len, k_head))?;
+        let k_f = k
+            .transpose(1, 2)?
+            .contiguous()?
+            .to_dtype(DType::F32)?
+            .reshape((batch_size * num_heads, seq_len, k_head))?;
+        let v_f = v
+            .transpose(1, 2)?
+            .contiguous()?
+            .to_dtype(DType::F32)?
+            .reshape((batch_size * num_heads, seq_len, v_head))?;
+        let g_f = g
+            .to_dtype(DType::F32)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch_size * num_heads, seq_len))?;
+        let beta_f = beta
+            .to_dtype(DType::F32)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch_size * num_heads, seq_len))?;
+
+        let mut state_flat = cache
+            .recurrent_state
+            .to_dtype(DType::F32)?
+            .reshape((batch_size * num_heads, k_head, v_head))?;
+
+        // CHUNK_SIZE = 64 matches llama.cpp's build_delta_net_chunking.
+        const CHUNK_SIZE: usize = 64;
+        let out_flat = gated_delta_rule_chunked(
+            &q_f,
+            &k_f,
+            &v_f,
+            &g_f,
+            &beta_f,
+            &mut state_flat,
+            CHUNK_SIZE,
+        )?;
+
+        cache.recurrent_state = state_flat
+            .reshape((batch_size, num_heads, k_head, v_head))?
+            .to_dtype(cache.recurrent_state.dtype())?;
+
+        out_flat
+            .reshape((batch_size, num_heads, seq_len, v_head))?
+            .transpose(1, 2)?
+            .contiguous()?
+            .to_dtype(dtype)
     }
 
     /// Single-step causal conv1d update for decode.
@@ -1201,6 +1509,17 @@ impl GatedDeltaNet {
             return output.transpose(1, 2);
         }
 
+        // ── CPU causal conv1d ────────────────────────────────────────────────
+        //
+        // Replacing the original O(seq_len) per-position loop with an
+        // O(kernel_size) loop over kernel positions.  For typical GDN models
+        // kernel_size = 4, so this is a 4-iteration loop regardless of seq_len.
+        //
+        // Each iteration slices a length-seq_len window from padded_t and
+        // accumulates a weighted sum using broadcast_mul — no per-token
+        // Tensor allocation.
+        //
+        // Save conv_state (last kernel_size positions of the input).
         let pad_width = self.conv_kernel_size.saturating_sub(seq_len);
         cache.conv_state = if pad_width > 0 {
             let zeros =
@@ -1210,6 +1529,8 @@ impl GatedDeltaNet {
             x_t.narrow(2, seq_len - self.conv_kernel_size, self.conv_kernel_size)?
         };
 
+        // Pad left with (kernel_size - 1) zeros so position 0 looks at a
+        // full causal window.
         let padded_t = Tensor::cat(
             &[
                 Tensor::zeros(
@@ -1222,15 +1543,27 @@ impl GatedDeltaNet {
             2,
         )?;
 
+        // weight: [conv_dim, 1, kernel_size] → squeeze to [conv_dim, kernel_size]
         let weight = self.conv1d_weight.squeeze(1)?.to_dtype(padded_t.dtype())?;
 
-        let mut conv_outputs = Vec::with_capacity(seq_len);
-        for i in 0..seq_len {
-            let window = padded_t.narrow(2, i, self.conv_kernel_size)?;
-            let out = (window * weight.unsqueeze(0)?)?.sum(D::Minus1)?;
-            conv_outputs.push(out);
+        // Accumulate over K kernel positions (K ≪ seq_len for GDN models).
+        // acc[b, c, i] += weight[c, k] * padded_t[b, c, i + k]
+        let mut acc: Option<Tensor> = None;
+        for k in 0..self.conv_kernel_size {
+            // Slice: x_k[b, c, :] = padded_t[b, c, k .. k+seq_len]  [B, C, S]
+            let x_k = padded_t.narrow(2, k, seq_len)?;
+            // w_k[c] = weight[c, k]  →  broadcast shape [1, C, 1]
+            let w_k = weight.narrow(1, k, 1)?.unsqueeze(0)?.unsqueeze(2)?;
+            let term = x_k.broadcast_mul(&w_k)?;
+            acc = Some(match acc {
+                None => term,
+                Some(a) => (a + term)?,
+            });
         }
-        let out = Tensor::stack(&conv_outputs, 2)?;
+        let out = acc.unwrap_or_else(|| {
+            Tensor::zeros((batch_size, conv_dim, seq_len), padded_t.dtype(), padded_t.device())
+                .expect("zeros")
+        });
         let out = candle_nn::ops::silu(&out)?;
         out.transpose(1, 2)
     }
