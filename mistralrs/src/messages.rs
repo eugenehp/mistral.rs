@@ -413,6 +413,7 @@ pub struct RequestBuilder {
     sampling_params: SamplingParams,
     web_search_options: Option<WebSearchOptions>,
     enable_thinking: Option<bool>,
+    reasoning_effort: Option<crate::core::ReasoningEffort>,
     truncate_sequence: bool,
     pending_prefixes: Vec<PendingMediaPrefix>,
 }
@@ -438,6 +439,7 @@ impl From<TextMessages> for RequestBuilder {
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
+            reasoning_effort: None,
             truncate_sequence: false,
             pending_prefixes: Vec::new(),
         }
@@ -459,6 +461,7 @@ impl From<VisionMessages> for RequestBuilder {
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
+            reasoning_effort: None,
             truncate_sequence: false,
             pending_prefixes: value.pending_prefixes,
         }
@@ -481,6 +484,7 @@ impl RequestBuilder {
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
+            reasoning_effort: None,
             truncate_sequence: false,
             pending_prefixes: Vec::new(),
         }
@@ -776,6 +780,16 @@ impl RequestBuilder {
         self
     }
 
+    /// Set the reasoning effort level for models that support it (Qwen3, etc.).
+    ///
+    /// Controls how many tokens the model may spend on chain-of-thought before
+    /// producing the final answer.  Has no effect when `enable_thinking` is
+    /// `false`.
+    pub fn set_reasoning_effort(mut self, effort: crate::core::ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+
     /// Truncate prompts that exceed the model's maximum context length.
     pub fn with_truncate_sequence(mut self, truncate_sequence: bool) -> Self {
         self.truncate_sequence = truncate_sequence;
@@ -803,7 +817,7 @@ impl RequestLike for RequestBuilder {
             RequestMessage::Chat {
                 messages: other,
                 enable_thinking: self.enable_thinking,
-                reasoning_effort: None,
+                reasoning_effort: self.reasoning_effort.take(),
             }
         } else {
             let mut other_messages = Vec::new();
@@ -817,7 +831,7 @@ impl RequestLike for RequestBuilder {
                 messages: other_messages,
                 audios: other_audios,
                 enable_thinking: self.enable_thinking,
-                reasoning_effort: None,
+                reasoning_effort: self.reasoning_effort.take(),
             }
         }
     }

@@ -321,31 +321,41 @@ pub fn get_model_paths(
     model_id: &Path,
     loading_from_uqff: bool,
 ) -> Result<Vec<PathBuf>> {
+    use rayon::prelude::*;
+
     match quantized_filename {
         Some(names) => {
             let id = quantized_model_id.unwrap();
-            let mut files = Vec::new();
 
-            for name in names {
-                let qapi = {
-                    let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
-                    let mut api = ApiBuilder::from_cache(cache)
-                        .with_progress(true)
-                        .with_token(get_token(token_source)?);
-                    if let Some(cache_dir) = crate::hf_hub_cache_dir() {
-                        api = api.with_cache_dir(cache_dir);
-                    }
-                    api.build().map_err(candle_core::Error::msg)?
-                };
-                let qapi = qapi.repo(Repo::with_revision(
-                    id.to_string(),
-                    RepoType::Model,
-                    revision.clone(),
-                ));
-                let model_id = Path::new(&id);
-                files.push(api_get_file!(qapi, name, model_id));
-            }
-            Ok(files)
+            // Each name may point to a different HF repo, so each download
+            // needs its own Api instance.  Build them all up-front (cheap,
+            // no network I/O) and then download in parallel.
+            let token = get_token(token_source)?;
+            let cache_dir = crate::hf_hub_cache_dir();
+
+            let files: Result<Vec<PathBuf>> = names
+                .par_iter()
+                .map(|name| {
+                    let qapi = {
+                        let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+                        let mut builder = ApiBuilder::from_cache(cache)
+                            .with_progress(true)
+                            .with_token(token.clone());
+                        if let Some(ref dir) = cache_dir {
+                            builder = builder.with_cache_dir(dir.clone());
+                        }
+                        builder.build().map_err(candle_core::Error::msg)?
+                    };
+                    let qapi = qapi.repo(Repo::with_revision(
+                        id.to_string(),
+                        RepoType::Model,
+                        revision.clone(),
+                    ));
+                    let qmodel_id = Path::new(id.as_str());
+                    crate::pipeline::hf::get_file(&qapi, qmodel_id, name)
+                })
+                .collect();
+            files
         }
         None => {
             // We only match these patterns for model names
@@ -354,7 +364,6 @@ pub fn get_model_paths(
             let consolidated_safetensor_match = Regex::new(CONSOLIDATED_SAFETENSOR_MATCH)?;
             let pickle_match = Regex::new(PICKLE_MATCH)?;
 
-            let mut filenames = vec![];
             let listing = api_dir_list!(api, model_id, true).filter(|x| {
                 safetensor_match.is_match(x)
                     || pickle_match.is_match(x)
@@ -386,16 +395,25 @@ pub fn get_model_paths(
                 anyhow::bail!("Expected file with extension one of .safetensors, .pth, .pt, .bin.");
             };
             info!(
-                "Found model weight filenames {:?}",
+                "Downloading {} model weight file(s) in parallel: {:?}",
+                files.len(),
                 files
                     .iter()
                     .map(|x| x.split('/').next_back().unwrap())
                     .collect::<Vec<_>>()
             );
-            for rfilename in files {
-                filenames.push(api_get_file!(api, &rfilename, model_id));
-            }
-            Ok(filenames)
+
+            // `ApiRepo` is `Clone + Send + Sync` (ureq::Agent is Send+Sync,
+            // hf_hub::Cache is Clone+Send, Repo is Clone+Send+Sync), so we can
+            // share a reference across rayon threads.  Each file is a distinct
+            // path in the HF cache, so there are no write conflicts.
+            // For an N-shard model this reduces wall-clock download time
+            // from (N × per-file-time) to roughly (max per-file-time).
+            let filenames: Result<Vec<PathBuf>> = files
+                .par_iter()
+                .map(|rfilename| crate::pipeline::hf::get_file(api, model_id, rfilename))
+                .collect();
+            filenames
         }
     }
 }

@@ -246,6 +246,7 @@ pub use messages::{
 pub use mistralrs_core::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
+pub use mistralrs_core::ReasoningEffort;
 pub use mistralrs_core::{SearchCallback, SearchResult, ToolCallback};
 pub use model::{best_device, Model};
 pub use model_builder_trait::{AnyModelBuilder, MultiModelBuilder};

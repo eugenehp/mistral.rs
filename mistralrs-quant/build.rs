@@ -48,6 +48,8 @@ fn main() -> Result<(), String> {
     println!("cargo::rustc-check-cfg=cfg(has_vector_fp8_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_kernels)");
     println!("cargo::rustc-check-cfg=cfg(has_mxfp4_wmma_kernels)");
+    // visionOS (xros) is a valid Apple target_os not yet in rustc's known list.
+    println!("cargo::rustc-check-cfg=cfg(target_os, values(\"xros\"))");
 
     #[cfg(feature = "cuda")]
     {
@@ -184,11 +186,21 @@ fn main() -> Result<(), String> {
             println!(
                 "cargo:warning=Skipping Metal kernel precompilation (MISTRALRS_METAL_PRECOMPILE=0)"
             );
-            // Write a dummy metallib file to satisfy the include_bytes! macro
+            // Write a dummy metallib file to satisfy the include_bytes! macro.
+            // Only the file for the current target platform is needed; the
+            // other two are guarded by #[cfg(target_os = "...")] in the source.
             let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
-            std::fs::write(out_dir.join("mistralrs_quant.metallib"), []).unwrap();
-            std::fs::write(out_dir.join("mistralrs_quant_ios.metallib"), []).unwrap();
-            std::fs::write(out_dir.join("mistralrs_quant_tvos.metallib"), []).unwrap();
+            let target = env::var("TARGET").unwrap_or_default();
+            let stub_name = if target.contains("-apple-ios") {
+                "mistralrs_quant_ios.metallib"
+            } else if target.contains("-apple-tvos") {
+                "mistralrs_quant_tvos.metallib"
+            } else if target.contains("-apple-xros") {
+                "mistralrs_quant_xros.metallib"
+            } else {
+                "mistralrs_quant.metallib"
+            };
+            std::fs::write(out_dir.join(stub_name), []).unwrap();
             return Ok(());
         }
 
@@ -196,14 +208,16 @@ fn main() -> Result<(), String> {
             MacOS,
             Ios,
             TvOS,
+            VisionOS,
         }
 
         impl Platform {
             fn sdk(&self) -> &str {
                 match self {
-                    Platform::MacOS => "macosx",
-                    Platform::Ios => "iphoneos",
-                    Platform::TvOS => "appletvos",
+                    Platform::MacOS    => "macosx",
+                    Platform::Ios      => "iphoneos",
+                    Platform::TvOS     => "appletvos",
+                    Platform::VisionOS => "xros",
                 }
             }
 
@@ -212,9 +226,13 @@ fn main() -> Result<(), String> {
                 // This fixes Xcode 26+ where the default Metal standard may be too low.
                 // https://github.com/EricLBuehler/mistral.rs/issues/1844
                 //
-                // Note: tvOS devices with A15+ (Apple TV 4K 3rd gen) support Metal 3.1.
+                // visionOS (Apple Vision Pro, M2) supports Metal 3.1.
+                // tvOS devices with A15+ (Apple TV 4K 3rd gen) support Metal 3.1.
                 match self {
-                    Platform::MacOS | Platform::Ios | Platform::TvOS => "metal3.1",
+                    Platform::MacOS
+                    | Platform::Ios
+                    | Platform::TvOS
+                    | Platform::VisionOS => "metal3.1",
                 }
             }
         }
@@ -266,9 +284,10 @@ fn main() -> Result<(), String> {
             // everything downstream (embedded via include_bytes!, loaded without
             // error, but no kernel functions found at runtime).
             let lib_name = match platform {
-                Platform::MacOS => "mistralrs_quant.metallib",
-                Platform::Ios => "mistralrs_quant_ios.metallib",
-                Platform::TvOS => "mistralrs_quant_tvos.metallib",
+                Platform::MacOS    => "mistralrs_quant.metallib",
+                Platform::Ios      => "mistralrs_quant_ios.metallib",
+                Platform::TvOS     => "mistralrs_quant_tvos.metallib",
+                Platform::VisionOS => "mistralrs_quant_xros.metallib",
             };
             let metallib = out_dir.join(lib_name);
             let mut compile_metallib_cmd = Command::new("xcrun");
@@ -326,9 +345,21 @@ fn main() -> Result<(), String> {
             Ok(())
         }
 
-        compile(Platform::MacOS)?;
-        compile(Platform::Ios)?;
-        compile(Platform::TvOS)?;
+        // Only compile the metallib for the platform we are actually targeting.
+        // Each platform's metallib is selected by #[cfg(target_os = "...")] in
+        // the source, so the other files are never included_bytes!-d and do not
+        // need to exist at all.
+        let target = env::var("TARGET").unwrap_or_default();
+        if target.contains("-apple-ios") {
+            compile(Platform::Ios)?;
+        } else if target.contains("-apple-tvos") {
+            compile(Platform::TvOS)?;
+        } else if target.contains("-apple-xros") {
+            compile(Platform::VisionOS)?;
+        } else {
+            // Covers aarch64-apple-darwin, x86_64-apple-darwin, etc.
+            compile(Platform::MacOS)?;
+        }
 
         Ok(())
     }

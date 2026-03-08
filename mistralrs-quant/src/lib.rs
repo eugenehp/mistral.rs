@@ -477,7 +477,17 @@ impl MatMul {
         // Metal quantized kernels (candle-metal) require F32 input and always
         // produce F32 output.  Cast to F32 before the call and restore the
         // original dtype afterwards so the rest of the graph stays in BF16/F16.
-        if x.device().is_metal() && x.dtype() != DType::F32 {
+        //
+        // Only apply this dtype dance for *quantized* layers (e.g. GGUF, ISQ,
+        // AWQ, …) that actually need F32 activations on Metal.  For plain
+        // unquantized (BF16/F16) weights we must NOT convert to F32: the
+        // resulting F32×BF16 matmul is either unsupported by MPS or bypasses
+        // the Metal GEMV fast path (which requires matching dtypes), producing
+        // wrong results or a silent dtype mismatch in downstream computations.
+        if x.device().is_metal()
+            && x.dtype() != DType::F32
+            && matmul.quantized_act_type().is_some()
+        {
             let original_dtype = x.dtype();
             let out = matmul.forward(&x.to_dtype(DType::F32)?)?;
             if out.dtype() != original_dtype {

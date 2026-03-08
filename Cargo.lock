@@ -3593,6 +3593,7 @@ dependencies = [
  "tqdm",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "urlencoding",
  "utoipa",
  "uuid 1.19.0",
