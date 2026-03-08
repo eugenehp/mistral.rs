@@ -27,7 +27,11 @@ using namespace metal;
 // issues that arise from dynamically-indexed thread-local arrays.
 // ============================================================================
 
-#define GDN_BV 64u
+#define GDN_BV    64u
+// Maximum supported key-head dimension.  Raising this costs registers but
+// never affects correctness; lower values keep occupancy higher.
+// Qwen3.5-0.6B uses K=64, Qwen3.5-7B uses K=128.  256 covers all variants.
+#define GDN_MAX_K 256u
 
 kernel void gdn_recurrence(
     device const float* q       [[buffer(0)]],
@@ -51,7 +55,6 @@ kernel void gdn_recurrence(
     const uint v_idx   = v_tile * GDN_BV + tid;
     // NOTE: do NOT early-return here – threads beyond v_dim must still
     // participate in all threadgroup_barrier() calls to avoid deadlock.
-    // They just skip reads/writes of their (invalid) column.
     const bool valid   = (v_idx < v_dim);
 
     const uint K = k_dim;
@@ -62,37 +65,42 @@ kernel void gdn_recurrence(
     device const float* v_bh    = v    + bh * seq_len * V;
     device const float* g_bh    = g    + bh * seq_len;
     device const float* beta_bh = beta + bh * seq_len;
-    // State column for this (bh, v_idx): st_col[j] = state[bh, j, v_idx]
-    // addressed as st_bh[j * V + v_idx].  Each thread owns one column.
-    device float* st_bh  = state  + bh * K * V;
-    device float* out_bh = output + bh * seq_len * V;
+    device float*       st_bh   = state  + bh * K * V;
+    device float*       out_bh  = output + bh * seq_len * V;
 
     // Shared memory layout: k_buf[K] | q_buf[K]
     threadgroup float* k_buf = shared;
     threadgroup float* q_buf = shared + K;
 
+    // ── Register-resident state ──────────────────────────────────────────────
+    // Each thread owns one column of the [K, V] state matrix (index v_idx).
+    // Loading K floats into a thread-local array eliminates the O(T × K)
+    // device-memory traffic of the original per-step read/write approach,
+    // replacing it with a single load + single store of K floats.
+    // On M3 Max, K ≤ 128 fits comfortably in the register file at BV=64.
+    float s[GDN_MAX_K];
+    if (valid) {
+        for (uint j = 0; j < K; j++)
+            s[j] = st_bh[j * V + v_idx];
+    }
+
     for (uint t = 0; t < seq_len; t++) {
         // ---- Step A: cooperatively load k_t --------------------------------
-        // ALL threads (including invalid ones) participate so every k_buf[j]
-        // is filled before the barrier.
         for (uint j = tid; j < K; j += GDN_BV) {
             k_buf[j] = k_bh[t * K + j];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float decay  = valid ? exp(g_bh[t])    : 1.0f;
-        float beta_t = valid ? beta_bh[t]       : 0.0f;
-        float v_t    = valid ? v_bh[t * V + v_idx] : 0.0f;
+        float decay  = valid ? exp(g_bh[t])         : 1.0f;
+        float beta_t = valid ? beta_bh[t]            : 0.0f;
+        float v_t    = valid ? v_bh[t * V + v_idx]  : 0.0f;
 
-        // ---- Pass 1: decay state, accumulate kv_mem ------------------------
-        // Each valid thread owns its own column (j * V + v_idx); invalid
-        // threads skip all device-memory accesses for this column.
+        // ---- Pass 1: decay register state, accumulate kv_mem ---------------
         float kv_mem = 0.0f;
         if (valid) {
             for (uint j = 0; j < K; j++) {
-                float s_j = st_bh[j * V + v_idx] * decay;
-                st_bh[j * V + v_idx] = s_j;
-                kv_mem = fma(s_j, k_buf[j], kv_mem);
+                s[j] *= decay;
+                kv_mem = fma(s[j], k_buf[j], kv_mem);
             }
         }
 
@@ -104,23 +112,24 @@ kernel void gdn_recurrence(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- Pass 2: update state, accumulate output -----------------------
+        // ---- Pass 2: update register state, accumulate output --------------
         float y_t = 0.0f;
         if (valid) {
             for (uint j = 0; j < K; j++) {
-                float s_j = fma(k_buf[j], delta, st_bh[j * V + v_idx]);
-                st_bh[j * V + v_idx] = s_j;
-                y_t = fma(s_j, q_buf[j], y_t);
+                s[j] = fma(k_buf[j], delta, s[j]);
+                y_t  = fma(s[j], q_buf[j], y_t);
             }
             out_bh[t * V + v_idx] = y_t;
         }
 
-        // Synchronize before next iteration overwrites k_buf / q_buf.
-        // ALL threads reach this barrier (invalid ones execute the no-op
-        // branches above and arrive here at the same time as valid threads).
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // State is already fully written back to device memory in the loops above.
+
+    // Write register state back to device memory once (was: every step).
+    if (valid) {
+        for (uint j = 0; j < K; j++)
+            st_bh[j * V + v_idx] = s[j];
+    }
 }
 
 // ============================================================================
@@ -173,22 +182,29 @@ kernel void gdn_recurrence_typed_impl(
     threadgroup float* k_buf = shared;
     threadgroup float* q_buf = shared + K;
 
+    // Register-resident state: one column of [K, V] per thread.
+    // Eliminates O(T × K) device-memory traffic → O(K) load + O(K) store.
+    float s[GDN_MAX_K];
+    if (valid) {
+        for (uint j = 0; j < K; j++)
+            s[j] = st_bh[j * V + v_idx];
+    }
+
     for (uint t = 0; t < seq_len; t++) {
         for (uint j = tid; j < K; j += GDN_BV) {
             k_buf[j] = float(k_bh[t * K + j]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float decay  = valid ? exp(float(g_bh[t]))          : 1.0f;
-        float beta_t = valid ? float(beta_bh[t])             : 0.0f;
-        float v_t    = valid ? float(v_bh[t * V + v_idx])    : 0.0f;
+        float decay  = valid ? exp(float(g_bh[t]))         : 1.0f;
+        float beta_t = valid ? float(beta_bh[t])            : 0.0f;
+        float v_t    = valid ? float(v_bh[t * V + v_idx])  : 0.0f;
 
         float kv_mem = 0.0f;
         if (valid) {
             for (uint j = 0; j < K; j++) {
-                float s_j = st_bh[j * V + v_idx] * decay;
-                st_bh[j * V + v_idx] = s_j;
-                kv_mem = fma(s_j, k_buf[j], kv_mem);
+                s[j] *= decay;
+                kv_mem = fma(s[j], k_buf[j], kv_mem);
             }
         }
 
@@ -202,13 +218,18 @@ kernel void gdn_recurrence_typed_impl(
         float y_t = 0.0f;
         if (valid) {
             for (uint j = 0; j < K; j++) {
-                float s_j = fma(k_buf[j], delta, st_bh[j * V + v_idx]);
-                st_bh[j * V + v_idx] = s_j;
-                y_t = fma(s_j, q_buf[j], y_t);
+                s[j] = fma(k_buf[j], delta, s[j]);
+                y_t  = fma(s[j], q_buf[j], y_t);
             }
             out_bh[t * V + v_idx] = y_t;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write register state back to device memory once.
+    if (valid) {
+        for (uint j = 0; j < K; j++)
+            st_bh[j * V + v_idx] = s[j];
     }
 }
 
@@ -628,4 +649,159 @@ INST_RMS_NORM_GATED(float,  float)
 INST_RMS_NORM_GATED(half,   half)
 #if __METAL_VERSION__ >= 310
 INST_RMS_NORM_GATED(bfloat, bfloat)
+#endif
+
+// ============================================================================
+// Kernel 7: gdn_gating_strided
+//
+// Same computation as gdn_gating but reads b and a directly from the fused
+// projection output buffer (layout [B*S, total_col]) using column offsets,
+// eliminating the two contiguous-copy dispatches that gdn_gating requires
+// when b and a are narrow (non-contiguous) views of the projection output.
+//
+// proj       : [B*S, total_col]  in InT — the raw matmul output, contiguous.
+// b_col      : column index where b values start (= z_end in FusedAll)
+// a_col      : column index where a values start (= b_end in FusedAll)
+// total_col  : number of columns in proj (= total_out_dim)
+// a_log      : [num_heads]  in F32
+// dt_bias    : [num_heads]  in F32
+// beta_out,
+// g_out      : [total_elems]  in InT   (total_elems = B * S * num_heads)
+//
+// Grid: (ceil(total_elems / BT),)   Threadgroup: (BT,)
+// ============================================================================
+template <typename T>
+kernel void gdn_gating_strided_impl(
+    device const T*     proj        [[buffer(0)]],
+    device const float* a_log       [[buffer(1)]],
+    device const float* dt_bias     [[buffer(2)]],
+    device T*           beta_out    [[buffer(3)]],
+    device T*           g_out       [[buffer(4)]],
+    constant uint&      num_heads   [[buffer(5)]],
+    constant uint&      total_col   [[buffer(6)]],
+    constant uint&      b_col       [[buffer(7)]],
+    constant uint&      a_col       [[buffer(8)]],
+    constant uint&      total_elems [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= total_elems) return;
+
+    uint head_idx = gid % num_heads;
+    uint row_idx  = gid / num_heads;  // B*S flat index
+
+    float b_val = float(proj[row_idx * total_col + b_col + head_idx]);
+    float a_val = float(proj[row_idx * total_col + a_col + head_idx]);
+
+    float beta = 1.0f / (1.0f + exp(-b_val));
+
+    float sp_in    = a_val + dt_bias[head_idx];
+    float softplus = log(1.0f + exp(sp_in));
+    float g_val    = -exp(a_log[head_idx]) * softplus;
+
+    beta_out[gid] = T(beta);
+    g_out[gid]    = T(g_val);
+}
+
+#define INST_GATING_STRIDED(T, suffix)                                              \
+    template [[host_name("gdn_gating_strided_" #suffix)]] [[kernel]] void           \
+    gdn_gating_strided_impl<T>(                                                     \
+        device const T*     proj        [[buffer(0)]],                              \
+        device const float* a_log       [[buffer(1)]],                              \
+        device const float* dt_bias     [[buffer(2)]],                              \
+        device T*           beta_out    [[buffer(3)]],                              \
+        device T*           g_out       [[buffer(4)]],                              \
+        constant uint&      num_heads   [[buffer(5)]],                              \
+        constant uint&      total_col   [[buffer(6)]],                              \
+        constant uint&      b_col       [[buffer(7)]],                              \
+        constant uint&      a_col       [[buffer(8)]],                              \
+        constant uint&      total_elems [[buffer(9)]],                              \
+        uint gid [[thread_position_in_grid]]);
+
+INST_GATING_STRIDED(half, half)
+#if __METAL_VERSION__ >= 310
+INST_GATING_STRIDED(bfloat, bfloat)
+#endif
+
+// ============================================================================
+// Kernel 8: gdn_l2_norm2
+//
+// Fused L2-normalisation of two tensors (q and k) in a single dispatch.
+// Replaces two calls to gdn_l2_norm with one, saving one Metal command-buffer
+// submission per GDN layer per decode/prefill step.
+//
+// Both xq and xk must have the same shape [..., D] and be contiguous.
+// Grid: (2*N, 1, 1) — groups [0, N) normalise q; groups [N, 2N) normalise k.
+// Each threadgroup works independently on one vector.
+//
+// xq, xk   : [N, D]  in T
+// yq, yk   : [N, D]  in T  (output)
+// N, D, eps: same as gdn_l2_norm
+// ============================================================================
+template <typename T>
+kernel void gdn_l2_norm2_impl(
+    device const T*    xq     [[buffer(0)]],
+    device       T*    yq     [[buffer(1)]],
+    device const T*    xk     [[buffer(2)]],
+    device       T*    yk     [[buffer(3)]],
+    constant uint&     N      [[buffer(4)]],
+    constant uint&     D      [[buffer(5)]],
+    constant float&    eps    [[buffer(6)]],
+    threadgroup float* shared [[threadgroup(0)]],  // (D + TPG) floats
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]])
+{
+    if (gid >= 2 * N) return;
+
+    // Select which tensor this group normalises.
+    bool is_k     = (gid >= N);
+    uint vec_idx  = is_k ? (gid - N) : gid;
+
+    device const T* x = is_k ? xk : xq;
+    device       T* y = is_k ? yk : yq;
+
+    threadgroup float* vals   = shared;       // [0..D)
+    threadgroup float* sq_buf = shared + D;   // [D..D+tpg)
+
+    float partial_sq = 0.0f;
+    for (uint i = tid; i < D; i += tpg) {
+        float v = float(x[vec_idx * D + i]);
+        vals[i] = v;
+        partial_sq += v * v;
+    }
+    sq_buf[tid] = partial_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tpg >> 1; s > 0; s >>= 1) {
+        if (tid < s) sq_buf[tid] += sq_buf[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_norm = rsqrt(sq_buf[0] + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < D; i += tpg) {
+        y[vec_idx * D + i] = T(vals[i] * inv_norm);
+    }
+}
+
+#define INST_L2NORM2(T, suffix)                                                     \
+    template [[host_name("gdn_l2_norm2_" #suffix)]] [[kernel]] void                 \
+    gdn_l2_norm2_impl<T>(                                                           \
+        device const T*    xq     [[buffer(0)]],                                    \
+        device       T*    yq     [[buffer(1)]],                                    \
+        device const T*    xk     [[buffer(2)]],                                    \
+        device       T*    yk     [[buffer(3)]],                                    \
+        constant uint&     N      [[buffer(4)]],                                    \
+        constant uint&     D      [[buffer(5)]],                                    \
+        constant float&    eps    [[buffer(6)]],                                    \
+        threadgroup float* shared [[threadgroup(0)]],                               \
+        uint gid [[threadgroup_position_in_grid]],                                  \
+        uint tid [[thread_position_in_threadgroup]],                                \
+        uint tpg [[threads_per_threadgroup]]);
+
+INST_L2NORM2(float,  float)
+INST_L2NORM2(half,   half)
+#if __METAL_VERSION__ >= 310
+INST_L2NORM2(bfloat, bfloat)
 #endif

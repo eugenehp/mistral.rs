@@ -496,6 +496,12 @@ struct GdnProjected {
     /// of the fused matmul output — already contiguous — so `forward()` can
     /// pass it straight to causal_conv1d without an extra `Tensor::cat` copy.
     qkv_for_conv: Option<Tensor>,
+    /// Full fused projection output [B, S, total_out_dim] (FusedAll path only).
+    ///
+    /// Carried through so `forward()` can pass it directly to the strided
+    /// gating kernel, which reads b and a via column offsets instead of
+    /// requiring two `contiguous()` copy dispatches on non-contiguous narrow views.
+    proj_all: Option<Tensor>,
 }
 
 pub struct GatedDeltaNet {
@@ -503,6 +509,10 @@ pub struct GatedDeltaNet {
     pub conv1d_weight: Tensor,
     pub dt_bias: Tensor,
     pub a_log: Tensor,
+    /// Cached F32 copy of a_log — avoids a to_dtype dispatch every forward step.
+    pub a_log_f32: Tensor,
+    /// Cached F32 copy of dt_bias — avoids a to_dtype dispatch every forward step.
+    pub dt_bias_f32: Tensor,
     pub norm: RmsNormGated,
     pub out_proj: Arc<dyn QuantMethod>,
     pub num_k_heads: usize,
@@ -631,6 +641,9 @@ impl GatedDeltaNet {
             vb_la.pp("out_proj"),
         )?;
 
+        let a_log_f32 = a_log.to_dtype(DType::F32)?;
+        let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?;
+
         Ok(Self {
             projection: GdnProjection::FusedQkvzBa {
                 in_proj_qkvz,
@@ -639,6 +652,8 @@ impl GatedDeltaNet {
             conv1d_weight,
             dt_bias,
             a_log,
+            a_log_f32,
+            dt_bias_f32,
             norm,
             out_proj,
             num_k_heads,
@@ -851,11 +866,16 @@ impl GatedDeltaNet {
             }
         };
 
+        let a_log_f32 = a_log.to_dtype(DType::F32)?;
+        let dt_bias_f32 = dt_bias.to_dtype(DType::F32)?;
+
         Ok(Self {
             projection,
             conv1d_weight,
             dt_bias,
             a_log,
+            a_log_f32,
+            dt_bias_f32,
             norm,
             out_proj,
             num_k_heads,
@@ -903,6 +923,9 @@ impl GatedDeltaNet {
                     // proj_qkv is already the contiguous [q|k|v_flat] slice —
                     // pass it through so forward() can skip the cat() copy.
                     qkv_for_conv: Some(proj_qkv),
+                    // Full projection output: used by the strided gating kernel
+                    // to read b and a without a contiguous-copy dispatch.
+                    proj_all: Some(all),
                 })
             }
             GdnProjection::FusedQkvzBa {
@@ -950,6 +973,7 @@ impl GatedDeltaNet {
                     b,
                     a,
                     qkv_for_conv: None,
+                    proj_all: None,
                 })
             }
             GdnProjection::SplitQkvZa {
@@ -977,6 +1001,7 @@ impl GatedDeltaNet {
                     b,
                     a,
                     qkv_for_conv: None,
+                    proj_all: None,
                 })
             }
             GdnProjection::SplitQkvZaMerged {
@@ -1004,6 +1029,7 @@ impl GatedDeltaNet {
                     b,
                     a,
                     qkv_for_conv: None,
+                    proj_all: None,
                 })
             }
         }
@@ -1025,6 +1051,7 @@ impl GatedDeltaNet {
             b,
             a,
             qkv_for_conv,
+            proj_all,
         } = projected;
 
         // 2. Concatenate q, k, v for conv1d: (batch, seq, conv_dim)
@@ -1052,8 +1079,42 @@ impl GatedDeltaNet {
         let k = k.reshape((batch_size, seq_len, self.num_k_heads, self.head_k_dim))?;
         let v = v.reshape((batch_size, seq_len, self.num_v_heads, self.head_v_dim))?;
 
-        // 5. Compute beta and g (3D: batch, seq, num_v_heads)
-        let (beta, g) = self.compute_gating(&b, &a, dtype)?;
+        // 5. Compute beta and g (3D: batch, seq, num_v_heads).
+        //
+        // Fast path (Metal + FusedAll): pass the raw projection buffer directly
+        // to the strided gating kernel, reading b and a by column offsets.
+        // Avoids two contiguous-copy Metal dispatches for the non-contiguous
+        // narrow views that FusedAll produces.
+        let (beta, g) = {
+            // Silence "unused variable" on non-Metal builds; proj_all is only
+            // consumed inside the #[cfg(feature = "metal")] arm below.
+            #[cfg(not(feature = "metal"))]
+            let _ = proj_all;
+            #[cfg(feature = "metal")]
+            {
+                if let (Some(proj), true) = (&proj_all, x.device().is_metal()) {
+                    if let GdnProjection::FusedAll { z_end, b_end, .. } = &self.projection {
+                        let (beta_flat, g_flat) =
+                            crate::metal::gdn::fused_gdn_gating_strided_metal(
+                                proj,
+                                *z_end,
+                                *b_end,
+                                self.num_v_heads,
+                                &self.a_log_f32,
+                                &self.dt_bias_f32,
+                            )?;
+                        let shape = b.shape();
+                        (beta_flat.reshape(shape)?, g_flat.reshape(shape)?)
+                    } else {
+                        self.compute_gating(&b, &a, dtype)?
+                    }
+                } else {
+                    self.compute_gating(&b, &a, dtype)?
+                }
+            }
+            #[cfg(not(feature = "metal"))]
+            self.compute_gating(&b, &a, dtype)?
+        };
 
         // 6. If num_v_heads > num_k_heads, repeat_interleave q and k
         let (q, k) = if v_per_group > 1 {
@@ -1070,9 +1131,22 @@ impl GatedDeltaNet {
             (q, k)
         };
 
-        // 7. L2-normalize q and k
-        let q = l2_norm(&q, 1e-6)?;
-        let k = l2_norm(&k, 1e-6)?;
+        // 7. L2-normalize q and k.
+        //
+        // Metal fast path: fused kernel dispatches one command buffer for both q
+        // and k (grid = 2*N groups), saving one Metal dispatch per layer per step.
+        let (q, k) = {
+            #[cfg(feature = "metal")]
+            if q.device().is_metal()
+                && matches!(dtype, candle_core::DType::F16 | candle_core::DType::BF16)
+            {
+                crate::metal::gdn::gdn_l2_norm2_metal(&q, &k, 1e-6_f32)?
+            } else {
+                (l2_norm(&q, 1e-6)?, l2_norm(&k, 1e-6)?)
+            }
+            #[cfg(not(feature = "metal"))]
+            (l2_norm(&q, 1e-6)?, l2_norm(&k, 1e-6)?)
+        };
 
         // 8. Apply recurrence
         let y = self.apply_recurrence(&q, &k, &v, &g, &beta, batch_size, seq_len, dtype, cache)?;
@@ -1101,19 +1175,21 @@ impl GatedDeltaNet {
     }
 
     /// Compute beta (sigmoid of b) and g (gating decay from a, A_log, dt_bias).
+    ///
+    /// Uses cached F32 copies of a_log and dt_bias (set at load time) to avoid
+    /// a to_dtype dispatch per call. Called for non-Metal paths and for non-FusedAll
+    /// Metal paths; the FusedAll Metal path uses the strided gating kernel in forward().
     fn compute_gating(&self, b: &Tensor, a: &Tensor, dtype: DType) -> Result<(Tensor, Tensor)> {
         #[cfg(feature = "cuda")]
         {
             if b.device().is_cuda() {
                 let b_flat = b.contiguous()?.flatten_all()?;
                 let a_flat = a.contiguous()?.flatten_all()?;
-                let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
-                let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
                 let (beta_flat, g_flat) = crate::cuda::gdn::fused_gdn_gating_cuda(
                     &b_flat,
                     &a_flat,
-                    &a_log_f32,
-                    &dt_bias_f32,
+                    &self.a_log_f32,
+                    &self.dt_bias_f32,
                 )?;
                 let shape = b.shape();
                 return Ok((beta_flat.reshape(shape)?, g_flat.reshape(shape)?));
@@ -1124,28 +1200,22 @@ impl GatedDeltaNet {
             if b.device().is_metal() {
                 let b_flat = b.contiguous()?.flatten_all()?;
                 let a_flat = a.contiguous()?.flatten_all()?;
-                let a_log_f32 = self.a_log.to_dtype(DType::F32)?.contiguous()?;
-                let dt_bias_f32 = self.dt_bias.to_dtype(DType::F32)?.contiguous()?;
                 let (beta_flat, g_flat) = crate::metal::gdn::fused_gdn_gating_metal(
                     &b_flat,
                     &a_flat,
-                    &a_log_f32,
-                    &dt_bias_f32,
+                    &self.a_log_f32,
+                    &self.dt_bias_f32,
                 )?;
                 let shape = b.shape();
                 return Ok((beta_flat.reshape(shape)?, g_flat.reshape(shape)?));
             }
         }
+        // CPU fallback: use cached F32 tensors to avoid to_dtype allocations.
         let beta = candle_nn::ops::sigmoid(b)?;
         let a_f = a.to_dtype(DType::F32)?;
-        let dt_bias_expanded = self
-            .dt_bias
-            .to_dtype(DType::F32)?
-            .unsqueeze(0)?
-            .unsqueeze(0)?;
+        let dt_bias_expanded = self.dt_bias_f32.unsqueeze(0)?.unsqueeze(0)?;
         let g = self
-            .a_log
-            .to_dtype(DType::F32)?
+            .a_log_f32
             .exp()?
             .neg()?
             .unsqueeze(0)?

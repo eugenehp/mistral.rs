@@ -143,6 +143,16 @@ pub fn gated_delta_rule_recurrence_metal_typed(
     let (bh, seq_len, k_dim) = q.dims3()?;
     let v_dim = v.dim(2)?;
 
+    // The Metal recurrence kernel uses a thread-local float[GDN_MAX_K] array.
+    // Exceeding the compile-time constant would silently read garbage.
+    const GDN_MAX_K: usize = 256;
+    if k_dim > GDN_MAX_K {
+        candle_core::bail!(
+            "gdn_recurrence_typed: k_dim={k_dim} exceeds GDN_MAX_K={GDN_MAX_K}; \
+             raise GDN_MAX_K in gdn.metal and this guard"
+        );
+    }
+
     // Acquire storage guards
     let q_sg = q.storage_and_layout().0;
     let k_sg = k.storage_and_layout().0;
@@ -242,6 +252,13 @@ pub fn gated_delta_rule_recurrence_metal(
 ) -> Result<Tensor> {
     let (bh, seq_len, k_dim) = q.dims3()?;
     let v_dim = v.dim(2)?;
+
+    const GDN_MAX_K: usize = 256;
+    if k_dim > GDN_MAX_K {
+        candle_core::bail!(
+            "gdn_recurrence: k_dim={k_dim} exceeds GDN_MAX_K={GDN_MAX_K}"
+        );
+    }
 
     // All inputs must be contiguous F32 (caller must ensure this)
     debug_assert_eq!(q.dtype(), DType::F32);
@@ -783,4 +800,199 @@ pub fn gdn_rms_norm_gated_metal(
         Storage::Metal(MetalStorage::new(out_arc, device.clone(), n * d, dtype)),
         Shape::from_dims(dims),
     )))
+}
+
+// ============================================================================
+// Kernel 7: fused_gdn_gating_strided_metal
+//
+// Reads b and a directly from the raw fused-projection output buffer using
+// (row, col) indexing, eliminating the two contiguous-copy dispatches that
+// the standard path requires when b and a are non-contiguous narrow views.
+//
+// proj      : [B, S, total_col] — the raw matmul output, already contiguous.
+// b_col     : column index where b values start  (= z_end in FusedAll)
+// a_col     : column index where a values start  (= b_end in FusedAll)
+// num_heads : num_v_heads
+// a_log     : [num_heads] F32 (cached at load time — no to_dtype per call)
+// dt_bias   : [num_heads] F32 (cached at load time — no to_dtype per call)
+//
+// Returns (beta, g) both [B*S*num_heads] in same dtype as proj.
+// ============================================================================
+pub fn fused_gdn_gating_strided_metal(
+    proj: &Tensor,
+    b_col: usize,
+    a_col: usize,
+    num_heads: usize,
+    a_log: &Tensor,
+    dt_bias: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    let proj = proj.contiguous()?;
+    let dtype = proj.dtype();
+
+    let suffix = match dtype {
+        DType::F16 => "half",
+        DType::BF16 => "bfloat",
+        other => candle_core::bail!("gdn_gating_strided: unsupported dtype {other:?}"),
+    };
+
+    let proj_dims = proj.dims();
+    let total_col = *proj_dims.last().unwrap();
+    let bs: usize = proj_dims[..proj_dims.len() - 1].iter().product();
+    let total_elements = bs * num_heads;
+
+    let a_log = a_log.contiguous()?;
+    let dt_bias = dt_bias.contiguous()?;
+
+    let (proj_sg, _) = proj.storage_and_layout();
+    let (a_log_sg, _) = a_log.storage_and_layout();
+    let (dt_bias_sg, _) = dt_bias.storage_and_layout();
+
+    let Storage::Metal(proj_ms) = &*proj_sg else {
+        candle_core::bail!("gdn_gating_strided: proj must be on Metal")
+    };
+    let Storage::Metal(a_log_ms) = &*a_log_sg else {
+        candle_core::bail!("gdn_gating_strided: a_log must be on Metal")
+    };
+    let Storage::Metal(dt_bias_ms) = &*dt_bias_sg else {
+        candle_core::bail!("gdn_gating_strided: dt_bias must be on Metal")
+    };
+
+    let device = proj_ms.device();
+    let raw_device = device.metal_device();
+
+    let (proj_buf, proj_off) = ms_buf_off(proj_ms, &proj);
+    let (a_log_buf, a_log_off) = ms_buf_off(a_log_ms, &a_log);
+    let (dt_bias_buf, dt_bias_off) = ms_buf_off(dt_bias_ms, &dt_bias);
+
+    let beta_arc: Arc<Buffer> =
+        device.new_buffer(total_elements, dtype, "gdn_gating_strided_beta")?;
+    let g_arc: Arc<Buffer> =
+        device.new_buffer(total_elements, dtype, "gdn_gating_strided_g")?;
+
+    let encoder = device.command_encoder()?;
+    encoder.set_label("gdn_gating_strided");
+
+    let name = format!("gdn_gating_strided_{suffix}");
+    let pipeline = get_pipeline(raw_device, &name)?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(proj_buf), proj_off);
+    encoder.set_buffer(1, Some(a_log_buf), a_log_off);
+    encoder.set_buffer(2, Some(dt_bias_buf), dt_bias_off);
+    encoder.set_buffer(3, Some(&*beta_arc), 0);
+    encoder.set_buffer(4, Some(&*g_arc), 0);
+
+    let nh = num_heads as u32;
+    let tc = total_col as u32;
+    let bc = b_col as u32;
+    let ac = a_col as u32;
+    let te = total_elements as u32;
+    set_bytes(&encoder, 5, &nh);
+    set_bytes(&encoder, 6, &tc);
+    set_bytes(&encoder, 7, &bc);
+    set_bytes(&encoder, 8, &ac);
+    set_bytes(&encoder, 9, &te);
+
+    let tpg_g = 256usize.min(total_elements.next_power_of_two());
+    encoder.dispatch_thread_groups(
+        MTLSize { width: total_elements.div_ceil(tpg_g), height: 1, depth: 1 },
+        MTLSize { width: tpg_g, height: 1, depth: 1 },
+    );
+
+    drop(encoder);
+
+    let beta = Tensor::from((
+        Storage::Metal(MetalStorage::new(beta_arc, device.clone(), total_elements, dtype)),
+        Shape::from_dims(&[total_elements]),
+    ));
+    let g_out = Tensor::from((
+        Storage::Metal(MetalStorage::new(g_arc, device.clone(), total_elements, dtype)),
+        Shape::from_dims(&[total_elements]),
+    ));
+    Ok((beta, g_out))
+}
+
+// ============================================================================
+// Kernel 8: gdn_l2_norm2_metal
+//
+// Normalises q and k in a single Metal dispatch (grid = 2*N groups).
+// Both tensors must have the same shape [..., D] and the same dtype.
+// Saves one Metal command-buffer submission per GDN layer per step vs two
+// separate gdn_l2_norm_metal calls.
+// ============================================================================
+pub fn gdn_l2_norm2_metal(xq: &Tensor, xk: &Tensor, eps: f32) -> Result<(Tensor, Tensor)> {
+    let dims = xq.dims();
+    let d = *dims.last().unwrap();
+    let n: usize = dims[..dims.len() - 1].iter().product();
+    let dtype = xq.dtype();
+
+    let suffix = match dtype {
+        DType::F16 => "half",
+        DType::BF16 => "bfloat",
+        DType::F32 => "float",
+        other => candle_core::bail!("gdn_l2_norm2: unsupported dtype {other:?}"),
+    };
+
+    let xq = xq.contiguous()?;
+    let xk = xk.contiguous()?;
+
+    let (xq_sg, _) = xq.storage_and_layout();
+    let (xk_sg, _) = xk.storage_and_layout();
+
+    let Storage::Metal(xq_ms) = &*xq_sg else {
+        candle_core::bail!("gdn_l2_norm2: xq must be on Metal")
+    };
+    let Storage::Metal(xk_ms) = &*xk_sg else {
+        candle_core::bail!("gdn_l2_norm2: xk must be on Metal")
+    };
+
+    let device = xq_ms.device();
+    let raw_device = device.metal_device();
+
+    let (xq_buf, xq_off) = ms_buf_off(xq_ms, &xq);
+    let (xk_buf, xk_off) = ms_buf_off(xk_ms, &xk);
+
+    let yq_arc: Arc<Buffer> = device.new_buffer(n * d, dtype, "gdn_l2_norm2_yq")?;
+    let yk_arc: Arc<Buffer> = device.new_buffer(n * d, dtype, "gdn_l2_norm2_yk")?;
+
+    let encoder = device.command_encoder()?;
+    encoder.set_label("gdn_l2_norm2");
+
+    let name = format!("gdn_l2_norm2_{suffix}");
+    let pipeline = get_pipeline(raw_device, &name)?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    encoder.set_buffer(0, Some(xq_buf), xq_off);
+    encoder.set_buffer(1, Some(&*yq_arc), 0);
+    encoder.set_buffer(2, Some(xk_buf), xk_off);
+    encoder.set_buffer(3, Some(&*yk_arc), 0);
+
+    let nn = n as u32;
+    let dd = d as u32;
+    set_bytes(&encoder, 4, &nn);
+    set_bytes(&encoder, 5, &dd);
+    set_bytes(&encoder, 6, &eps);
+
+    let tpg = d.next_power_of_two().min(64);
+    let shared_bytes = (d + tpg) * core::mem::size_of::<f32>();
+    encoder.set_threadgroup_memory_length(0, shared_bytes);
+
+    // Grid = 2*N groups: [0, N) normalise q, [N, 2N) normalise k.
+    encoder.dispatch_thread_groups(
+        MTLSize { width: 2 * n, height: 1, depth: 1 },
+        MTLSize { width: tpg, height: 1, depth: 1 },
+    );
+
+    drop(encoder);
+
+    let shape = Shape::from_dims(dims);
+    let yq = Tensor::from((
+        Storage::Metal(MetalStorage::new(yq_arc, device.clone(), n * d, dtype)),
+        shape.clone(),
+    ));
+    let yk = Tensor::from((
+        Storage::Metal(MetalStorage::new(yk_arc, device.clone(), n * d, dtype)),
+        shape,
+    ));
+    Ok((yq, yk))
 }
