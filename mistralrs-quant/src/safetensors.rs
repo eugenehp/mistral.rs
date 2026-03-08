@@ -235,6 +235,9 @@ impl MmapedSafetensors {
         let file = memmap2::MmapOptions::new()
             .map(&file)
             .map_err(|e| Error::from(e).with_path(p))?;
+        // Hint OS to start background prefetch immediately (see multi() for rationale).
+        #[cfg(unix)]
+        let _ = file.advise(memmap2::Advice::WillNeed);
         let safetensors = yoke::Yoke::<SafeTensors_<'static>, memmap2::Mmap>::try_attach_to_cart(
             file,
             |data: &[u8]| {
@@ -259,12 +262,25 @@ impl MmapedSafetensors {
     pub unsafe fn multi<P: AsRef<Path>>(paths: &[P]) -> Result<Self> {
         let mut routing = HashMap::new();
         let mut safetensors = vec![];
+
         for (index, p) in paths.iter().enumerate() {
             let p = p.as_ref();
             let file = std::fs::File::open(p).map_err(|e| Error::from(e).with_path(p))?;
             let file = memmap2::MmapOptions::new()
                 .map(&file)
                 .map_err(|e| Error::from(e).with_path(p))?;
+
+            // Issue a non-blocking hint to the OS to start reading all pages of
+            // this shard into the page-cache immediately.  For a model spread
+            // across N shard files the kernel will schedule I/O for all N shards
+            // concurrently, so by the time the model constructor accesses each
+            // tensor the pages are (often) already resident in RAM.
+            //
+            // This is a best-effort hint: it never blocks, never errors fatally,
+            // and is silently ignored on platforms that don't support it.
+            #[cfg(unix)]
+            let _ = file.advise(memmap2::Advice::WillNeed);
+
             let data = yoke::Yoke::<SafeTensors_<'static>, memmap2::Mmap>::try_attach_to_cart(
                 file,
                 |data: &[u8]| {
@@ -278,6 +294,7 @@ impl MmapedSafetensors {
             }
             safetensors.push(data)
         }
+
         Ok(Self {
             safetensors,
             routing: Some(routing),
