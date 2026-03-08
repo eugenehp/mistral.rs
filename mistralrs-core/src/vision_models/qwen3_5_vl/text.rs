@@ -5,7 +5,7 @@
 
 use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Embedding;
-use mistralrs_quant::{QuantMethod, ReplicatedLayer, ShardedVarBuilder};
+use mistralrs_quant::{MatMul, QuantMethod, ReplicatedLayer, ShardedVarBuilder};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -609,11 +609,8 @@ impl Qwen3_5VLTextModel {
 
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
-        let mut xs = extract_logits(&xs, context_lens)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        self.lm_head.forward(&xs)
+        let xs = extract_logits(&xs, context_lens)?;
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 
     /// DeepStack: hidden_states[visual_mask] += visual_embeds

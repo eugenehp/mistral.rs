@@ -79,8 +79,24 @@ impl Kernels {
         if let Some(lib) = LIBRARY.get() {
             Ok(lib.clone())
         } else {
+            // A real mistralrs_quant.metallib is tens of MB.  When the build
+            // produces a valid-but-empty 118-byte stub (e.g. because the
+            // `xcrun metallib` link step failed silently), the bytes are non-
+            // zero so the old `!KERNELS.is_empty()` check incorrectly treated
+            // the stub as a usable library.  Metal loads it without error but
+            // reports no functions, causing "function not found" at runtime.
+            //
+            // Guard with a minimum byte threshold: anything under 4 KB cannot
+            // contain real kernel functions and must fall through to the runtime
+            // compilation path.  The threshold is conservative — the actual
+            // library is >10 MB.
+            //
+            // MISTRALRS_METAL_PRECOMPILE=0 writes a 0-byte placeholder, which
+            // also falls below the threshold, so that escape hatch still works.
+            const MIN_VALID_METALLIB_BYTES: usize = 4096;
+
             // Try to load precompiled metallib first (faster startup)
-            let lib = if !KERNELS.is_empty() {
+            let lib = if KERNELS.len() >= MIN_VALID_METALLIB_BYTES {
                 // Load precompiled metallib directly from embedded bytes via DispatchData.
                 // This avoids writing to a temp file, which can fail in sandboxed
                 // environments (e.g. macOS apps distributed via TestFlight).
@@ -97,8 +113,9 @@ impl Kernels {
                     })?;
                 Library::new(raw_lib)
             } else {
-                // Fall back to runtime compilation if precompiled lib is not available
-                // (e.g., when MISTRALRS_METAL_PRECOMPILE=0)
+                // Fall back to runtime compilation if precompiled lib is not
+                // available (MISTRALRS_METAL_PRECOMPILE=0) or is a stub produced
+                // by a failed-but-silent xcrun metallib invocation.
                 self.compile_kernels_at_runtime(device)?
             };
             Ok(LIBRARY.get_or_init(|| lib).clone())

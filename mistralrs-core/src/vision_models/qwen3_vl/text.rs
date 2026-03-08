@@ -69,14 +69,9 @@ impl Mlp {
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let lhs = self.gate_proj.forward(&xs)?.apply(&self.act_fn)?;
-        let rhs = self.up_proj.forward(&xs)?;
-        self.down_proj
-            .forward(&(lhs * rhs)?)?
+        let lhs = MatMul.qmethod_matmul(xs, &*self.gate_proj)?.apply(&self.act_fn)?;
+        let rhs = MatMul.qmethod_matmul(xs, &*self.up_proj)?;
+        MatMul.qmethod_matmul(&(lhs * rhs)?, &*self.down_proj)?
             .to_dtype(original_dtype)
     }
 }
@@ -292,7 +287,7 @@ impl Attention {
         } else {
             attn_output.reshape((b_sz, q_len, ()))?
         };
-        let mut res = self.o_proj.forward(&attn_output)?;
+        let mut res = MatMul.qmethod_matmul(&attn_output, &*self.o_proj)?;
         if self.q_proj.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }
@@ -561,11 +556,8 @@ impl Qwen3VLTextModel {
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
-        let mut xs = extract_logits(&xs, context_lens)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        self.lm_head.forward(&xs)
+        let xs = extract_logits(&xs, context_lens)?;
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 
     /// Matches transformers `_deepstack_process`:

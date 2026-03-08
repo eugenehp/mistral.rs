@@ -2742,10 +2742,17 @@ template <typename T, const int group_size, const int bits>
                                 device T *biases [[buffer(3)]],
                                 uint2 index [[thread_position_in_grid]],
                                 uint2 grid_dim [[threads_per_grid]]) {
-  constexpr T eps = T(1e-7);
-  constexpr int simd_size = 32;
-  constexpr T n_bins =
+  // Use float intermediates for constexpr quantities to avoid Metal compiler
+  // failures when T = bfloat16_t: constexpr T(float_literal) and
+  // constexpr T(int_expression) may not be evaluable at compile time for
+  // bfloat16_t, causing the template specialisation to be silently dropped
+  // from the metallib (fixes missing affine_quantize_bfloat16_t_gs_*_b_*).
+  constexpr float eps_f = 1e-7f;
+  constexpr int n_bins_i =
       bits == 40 ? 15 : (1 << bits) - 1; // mxfp4 has 16 values (0-15)
+  const T eps = T(eps_f);
+  const T n_bins = T(n_bins_i);
+  constexpr int simd_size = 32;
   constexpr int packs_per_int = bits == 3    ? 8
                                 : bits == 6  ? 4
                                 : bits == 40 ? 2

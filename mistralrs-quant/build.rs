@@ -244,32 +244,27 @@ fn main() -> Result<(), String> {
             for metal_file in HEADER_SOURCES {
                 compile_air_cmd.arg(sources.join(format!("{metal_file}.metal")));
             }
-            compile_air_cmd
+            // Spawn the Metal→AIR compilation once and wait for it to finish,
+            // checking the exit code.  (Previously this was spawned twice — the
+            // first call discarded the exit status and the second call repeated
+            // the work — which could produce stale .air files on a failed build.)
+            let status = compile_air_cmd
                 .spawn()
-                .expect("Failed to compile air")
+                .expect("Failed to spawn Metal→AIR compiler (xcrun metal -c)")
                 .wait()
-                .expect("Failed to compile air");
-
-            let mut child = compile_air_cmd.spawn().expect("Failed to compile air");
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        panic!("Compiling metal -> air failed. Exit with status: {status}")
-                    }
-                }
-                Ok(None) => {
-                    let status = child
-                        .wait()
-                        .expect("Compiling metal -> air failed while waiting for result");
-                    if !status.success() {
-                        panic!("Compiling metal -> air failed. Exit with status: {status}")
-                    }
-                }
-                Err(e) => panic!("Compiling metal -> air failed: {e:?}"),
+                .expect("Failed to wait for Metal→AIR compiler");
+            if !status.success() {
+                panic!("Compiling metal → air failed. Exit status: {status}");
             }
 
-            // Compile air to metallib
+            // ── AIR → metallib ────────────────────────────────────────────────
+            //
+            // Use `xcrun --sdk <sdk> metallib` (the dedicated metallib linker),
+            // NOT `xcrun metal`, for the linking step.  On Xcode 15/16+ the
+            // `metal` driver used without `--sdk` can produce a valid-but-empty
+            // 118-byte metallib stub and still exit 0, which silently breaks
+            // everything downstream (embedded via include_bytes!, loaded without
+            // error, but no kernel functions found at runtime).
             let lib_name = match platform {
                 Platform::MacOS => "mistralrs_quant.metallib",
                 Platform::Ios => "mistralrs_quant_ios.metallib",
@@ -277,35 +272,56 @@ fn main() -> Result<(), String> {
             };
             let metallib = out_dir.join(lib_name);
             let mut compile_metallib_cmd = Command::new("xcrun");
-            compile_metallib_cmd.arg("metal").arg("-o").arg(&metallib);
+            compile_metallib_cmd
+                .arg("--sdk")
+                .arg(platform.sdk())
+                .arg("metallib")
+                .arg("-o")
+                .arg(&metallib);
 
             for metal_file in METAL_SOURCES {
                 compile_metallib_cmd.arg(out_dir.join(format!("{metal_file}.air")));
             }
+            // Note: header-only .air files (utils, bf16, scan_impl, …) are
+            // included transitively; linking them separately is harmless.
             for metal_file in HEADER_SOURCES {
                 compile_metallib_cmd.arg(out_dir.join(format!("{metal_file}.air")));
             }
 
-            let mut child = compile_metallib_cmd
+            let status = compile_metallib_cmd
                 .spawn()
-                .expect("Failed to compile air -> metallib");
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        panic!("Compiling air -> metallib failed. Exit with status: {status}")
-                    }
-                }
-                Ok(None) => {
-                    let status = child
-                        .wait()
-                        .expect("Compiling air -> metallib failed while waiting for result");
-                    if !status.success() {
-                        panic!("Compiling air -> metallib failed. Exit with status: {status}")
-                    }
-                }
-                Err(e) => panic!("Compiling air -> metallib failed: {e:?}"),
+                .expect("Failed to spawn AIR→metallib linker (xcrun metallib)")
+                .wait()
+                .expect("Failed to wait for AIR→metallib linker");
+            if !status.success() {
+                panic!("Compiling air → metallib failed. Exit status: {status}");
             }
+
+            // Guard against a silent failure that produces a stub file: a real
+            // mistralrs_quant.metallib is tens of MB; anything under 4 KB means
+            // the linker ran but produced no functions.
+            let metallib_size = std::fs::metadata(&metallib)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if metallib_size < 4096 {
+                panic!(
+                    "Metallib sanity check failed: {path} is only {size} bytes \
+                     (expected tens of MB).  The xcrun metallib step likely \
+                     succeeded with an empty output.  Check that Xcode command \
+                     line tools are installed and that xcrun can find the \
+                     '{sdk}' SDK.\n\
+                     \n\
+                     Set MISTRALRS_METAL_PRECOMPILE=0 to fall back to runtime \
+                     Metal compilation and skip this precompilation step.",
+                    path = metallib.display(),
+                    size = metallib_size,
+                    sdk = platform.sdk(),
+                );
+            }
+            println!(
+                "cargo:warning=mistralrs-quant: {lib_name} linked successfully \
+                 ({metallib_size} bytes)"
+            );
 
             Ok(())
         }

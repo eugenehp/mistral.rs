@@ -474,6 +474,17 @@ impl MatMul {
 
     /// Compute quantized matrix-matrix product.
     pub fn qmethod_matmul(&self, x: &Tensor, matmul: &dyn QuantMethod) -> Result<Tensor> {
+        // Metal quantized kernels (candle-metal) require F32 input and always
+        // produce F32 output.  Cast to F32 before the call and restore the
+        // original dtype afterwards so the rest of the graph stays in BF16/F16.
+        if x.device().is_metal() && x.dtype() != DType::F32 {
+            let original_dtype = x.dtype();
+            let out = matmul.forward(&x.to_dtype(DType::F32)?)?;
+            if out.dtype() != original_dtype {
+                return out.to_dtype(original_dtype);
+            }
+            return Ok(out);
+        }
         matmul.forward(x)
     }
 }
