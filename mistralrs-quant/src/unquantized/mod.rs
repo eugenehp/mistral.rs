@@ -288,7 +288,6 @@ impl QuantMethod for UnquantLinear {
                 }
             }
             Some(IsqType::AFQ2 | IsqType::AFQ3 | IsqType::AFQ4 | IsqType::AFQ6 | IsqType::AFQ8) => {
-                let _acquired_quantize_guard = guard.acquire(&device);
                 if imatrix_weight.is_some() {
                     // TODO just warn?
                     candle_core::bail!("AFQ does not support imatrix.");
@@ -304,9 +303,17 @@ impl QuantMethod for UnquantLinear {
                     _ => unreachable!(),
                 };
 
+                // Upload weights to the target device BEFORE acquiring the
+                // guard.  This lets another thread's upload pipeline with this
+                // thread's GPU quantization kernel (the guard serializes only
+                // the kernel submission, not the weight transfer).
+                let weight_on_device = self.w.to_device(&device)?;
+                let bias_on_device = self.b.as_ref().map(|b| b.to_device(&device)).transpose()?;
+
+                let _acquired_quantize_guard = guard.acquire(&device);
                 Ok(Arc::new(AfqLayer::new(QuantMethodConfig::Afq {
-                    weight: self.w.to_device(&device)?,
-                    bias: self.b.as_ref().map(|b| b.to_device(&device).unwrap()),
+                    weight: weight_on_device,
+                    bias: bias_on_device,
                     bits,
                     group_size: AfqGroupSize::default(),
                 })?))

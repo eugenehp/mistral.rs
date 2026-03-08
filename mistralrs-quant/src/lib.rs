@@ -584,15 +584,22 @@ impl IsqType {
     pub fn get_max_isq_cpu_threads(&self) -> Option<NonZeroUsize> {
         match self {
             /*IsqType::HQQ1 | IsqType::HQQ2 | IsqType::HQQ3 | */
-            IsqType::HQQ4
-            | IsqType::HQQ8
-            | IsqType::AFQ2
+            IsqType::HQQ4 | IsqType::HQQ8 => {
+                // HQQ quantizes entirely on the GPU; the guard serialises
+                // kernel submission so there is nothing to pipeline.
+                Some(1.try_into().unwrap())
+            }
+            IsqType::AFQ2
             | IsqType::AFQ3
             | IsqType::AFQ4
             | IsqType::AFQ6
             | IsqType::AFQ8 => {
-                // Use 1 because our HQQ quantizes on the GPU
-                Some(1.try_into().unwrap())
+                // AFQ: weight upload (to_device) now happens outside the guard
+                // so a second thread can transfer the next layer's weights
+                // while the GPU is running the current layer's quantization
+                // kernel.  More than 2 threads gives diminishing returns while
+                // doubling peak memory per extra thread.
+                Some(2.try_into().unwrap())
             }
             IsqType::F8E4M3 | IsqType::F8Q8 => None,
             IsqType::Q2K
