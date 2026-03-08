@@ -490,6 +490,12 @@ struct GdnProjected {
     b: Tensor,
     /// (batch, seq, num_v_heads)
     a: Tensor,
+    /// Pre-concatenated [q|k|v_flat] slice produced by FusedAll.
+    ///
+    /// When present (FusedAll path only), this is the first `qkv_end` columns
+    /// of the fused matmul output — already contiguous — so `forward()` can
+    /// pass it straight to causal_conv1d without an extra `Tensor::cat` copy.
+    qkv_for_conv: Option<Tensor>,
 }
 
 pub struct GatedDeltaNet {
@@ -894,6 +900,9 @@ impl GatedDeltaNet {
                     z,
                     b,
                     a,
+                    // proj_qkv is already the contiguous [q|k|v_flat] slice —
+                    // pass it through so forward() can skip the cat() copy.
+                    qkv_for_conv: Some(proj_qkv),
                 })
             }
             GdnProjection::FusedQkvzBa {
@@ -940,6 +949,7 @@ impl GatedDeltaNet {
                     z,
                     b,
                     a,
+                    qkv_for_conv: None,
                 })
             }
             GdnProjection::SplitQkvZa {
@@ -966,6 +976,7 @@ impl GatedDeltaNet {
                     z,
                     b,
                     a,
+                    qkv_for_conv: None,
                 })
             }
             GdnProjection::SplitQkvZaMerged {
@@ -992,6 +1003,7 @@ impl GatedDeltaNet {
                     z,
                     b,
                     a,
+                    qkv_for_conv: None,
                 })
             }
         }
@@ -1012,10 +1024,17 @@ impl GatedDeltaNet {
             z,
             b,
             a,
+            qkv_for_conv,
         } = projected;
 
         // 2. Concatenate q, k, v for conv1d: (batch, seq, conv_dim)
-        let mixed_qkv = Tensor::cat(&[&q, &k, &v_flat], D::Minus1)?;
+        //
+        // FusedAll already gives us a contiguous [q|k|v_flat] slice — reuse it
+        // directly and skip the Metal copy kernel that cat() would issue.
+        let mixed_qkv = match qkv_for_conv {
+            Some(raw) => raw,
+            None => Tensor::cat(&[&q, &k, &v_flat], D::Minus1)?,
+        };
 
         // 3. Apply causal conv1d (includes silu activation)
         let mixed_qkv = if cache.seqlen_offset > 0 && seq_len == 1 {
